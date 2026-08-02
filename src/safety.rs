@@ -32,6 +32,7 @@ pub const CAP_TRIP_INPUT_SAMPLED: u16 = 1 << 3;
 pub const CAP_CORE_POWER_CUTOFF: u16 = 1 << 4;
 pub const CAP_FAN_TACH_INTERLOCK: u16 = 1 << 5;
 pub const CAP_INDEPENDENT_TRIP_MONITOR: u16 = 1 << 6;
+pub const CAP_FAN_CONTROLLED_SPEED: u16 = 1 << 7;
 
 pub const EVIDENCE_OUTPUTS_SAFE: u16 = 1 << 0;
 pub const EVIDENCE_LEASE_VALID: u16 = 1 << 1;
@@ -41,7 +42,7 @@ pub const EVIDENCE_CORE_CUTOFF_AVAILABLE: u16 = 1 << 4;
 pub const EVIDENCE_FAN_TACH_INTERLOCK_AVAILABLE: u16 = 1 << 5;
 pub const EVIDENCE_INDEPENDENT_TRIP_MONITOR_AVAILABLE: u16 = 1 << 6;
 
-const REQUIRED_PRODUCTION_CAPABILITIES: u16 = CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED | CAP_CORE_POWER_CUTOFF | CAP_FAN_TACH_INTERLOCK | CAP_INDEPENDENT_TRIP_MONITOR;
+const REQUIRED_PRODUCTION_CAPABILITIES: u16 = CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED | CAP_CORE_POWER_CUTOFF | CAP_FAN_TACH_INTERLOCK | CAP_INDEPENDENT_TRIP_MONITOR | CAP_FAN_CONTROLLED_SPEED;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,7 +127,7 @@ impl SafetyConfig {
             // These describe only the control paths implemented by this firmware.
             // Independent VCORE cutoff, tach interlock, and independent trip
             // monitoring are deliberately absent until hardware proves them.
-            capabilities: CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED,
+            capabilities: CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED | CAP_FAN_CONTROLLED_SPEED,
         }
     }
 }
@@ -326,9 +327,6 @@ impl SafetyPolicy {
         }
 
         self.ensure_controlled(now_ms)?;
-        if self.config.stage.enforces_lease() && self.requested_outputs.five_volt_enabled {
-            return Err(SafetyError::InvalidSequence);
-        }
         self.requested_outputs.fan_percent = percent;
         Ok(())
     }
@@ -457,7 +455,7 @@ impl SafetyPolicy {
 mod tests {
     use super::*;
 
-    const IMPLEMENTED_CAPABILITIES: u16 = CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED;
+    const IMPLEMENTED_CAPABILITIES: u16 = CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED | CAP_FAN_CONTROLLED_SPEED;
 
     fn config(stage: SafetyStage) -> SafetyConfig {
         SafetyConfig {
@@ -540,6 +538,8 @@ mod tests {
         policy.arm(100).unwrap();
         policy.request_five_volt_enabled(true, 100).unwrap();
         policy.request_asic_reset_asserted(false, 100).unwrap();
+        policy.request_fan_percent(40, 100).unwrap();
+        assert_eq!(policy.outputs().fan_percent, 40);
 
         policy.heartbeat(900).unwrap();
         policy.tick(1_899, false);
@@ -611,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn full_fan_is_required_while_five_volt_output_is_enabled() {
+    fn full_fan_is_required_before_power_but_control_is_allowed_while_running() {
         let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
 
         policy.arm(0).unwrap();
@@ -619,7 +619,12 @@ mod tests {
         assert_eq!(policy.request_five_volt_enabled(true, 0), Err(SafetyError::FanNotSafe));
         policy.request_fan_percent(100, 0).unwrap();
         policy.request_five_volt_enabled(true, 0).unwrap();
-        assert_eq!(policy.request_fan_percent(99, 0), Err(SafetyError::InvalidSequence));
+        policy.request_asic_reset_asserted(false, 0).unwrap();
+        policy.request_fan_percent(50, 0).unwrap();
+        assert_eq!(policy.outputs().fan_percent, 50);
+
+        policy.disarm();
+        assert_eq!(policy.outputs(), SafetyOutputs::SAFE);
     }
 
     #[test]

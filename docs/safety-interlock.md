@@ -62,9 +62,11 @@ lease. The policy additionally enforces:
 
 1. fan at 100 percent and reset asserted before enabling 5 V;
 2. 5 V enabled before releasing ASIC reset; and
-3. 5 V disabled before lowering the fan below 100 percent.
+3. a live `CONTROLLED` lease before lowering the fan below 100 percent.
 
-Disabling 5 V also asserts reset and restores the full-fan request.
+After 5 V is enabled, the controlled host may lower the fan while it continues
+to own temperature, tachometer, and minimum-speed supervision. Disabling 5 V,
+disarming, lease expiry, and trip faults all restore the full-fan request.
 
 ## Host integration
 
@@ -76,13 +78,15 @@ A host should use this sequence:
    at 100 percent.
 4. Send `ARM`.
 5. Confirm `CONTROLLED`, a nonzero lease, no fault, and trip clear.
-6. Keep the fan at 100 percent.
+6. Keep the fan at 100 percent through power enable and reset release.
 7. Enable 5 V.
 8. Release reset only after any host-owned physical rail checks pass.
-9. Send `HEARTBEAT` well inside the two-second lease while controlled.
-10. For shutdown, assert reset, disable 5 V, command full fan, and send
+9. Apply a lower fan target only after host-owned temperature and tachometer
+   supervision is active.
+10. Send `HEARTBEAT` well inside the two-second lease while controlled.
+11. For shutdown, assert reset, disable 5 V, command full fan, and send
     `DISARM`.
-11. Confirm coherent `SAFE_OFF` status.
+12. Confirm coherent `SAFE_OFF` status.
 
 The safety commands are:
 
@@ -140,8 +144,9 @@ The status payload distinguishes:
 - effective output commands; and
 - sampled trip input.
 
-Current capability bits are `0x000f`: 5 V control, ASIC reset control, full-fan
-command, and trip sampling. The Bridge intentionally does not claim:
+Current capability bits are `0x008f`: 5 V control, ASIC reset control,
+full-fan command, trip sampling, and controlled fan speed while powered. The
+Bridge intentionally does not claim:
 
 - independent VCORE cutoff;
 - autonomous fan-tach interlock; or

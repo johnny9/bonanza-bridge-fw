@@ -305,10 +305,11 @@ Capability and matching evidence bits are:
 | 4 | Independent VCORE cutoff | **Not set** |
 | 5 | Autonomous fan-tach interlock | **Not set** |
 | 6 | Trip monitor independent of the command task | **Not set** |
+| 7 | Controlled fan speed while powered | Set |
 
 Evidence bits 0 through 3 mean outputs-safe, lease-valid, trip-clear, and
 fault-clear. Evidence bits 4 through 6 mirror the three independent hardware
-capabilities above. The current firmware capability value is `0x000f`, so a
+capabilities above. The current firmware capability value is `0x008f`, so a
 healthy status reports production verdict `0x81` (capability gap). This field
 is retained for protocol compatibility and must not be changed without the
 corresponding hardware integration and tests.
@@ -369,3 +370,8 @@ Example:
 - Set fan speed to 50%:  `07 00 00 00 09 10 32`
 - Set fan speed to 100%: `07 00 00 00 09 10 64`
 - Read fan tach (RPM):   `06 00 00 00 09 20`
+
+The fan must be at 100% before enabling 5 V. Once the bridge is controlled
+under a live lease, the host may apply a lower running target and is
+responsible for temperature, tachometer, and minimum-speed supervision.
+Disabling 5 V, disarming, lease expiry, or an ASIC trip restores 100%.
