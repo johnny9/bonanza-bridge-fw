@@ -21,13 +21,13 @@ use static_cell::StaticCell;
 
 use bonanza_bridge_fw::image_manifest;
 use bonanza_bridge_fw::safety_timing::WATCHDOG_TIMEOUT_MS;
-use bonanza_bridge_fw::uart_timing::ESP_DATA_BAUD_RATE;
 
 mod control;
 mod pio_uart;
 mod uart;
 
 const CONTROL_BAUDRATE: u32 = 115_200;
+const ESP_DATA_BAUDRATE: u32 = 2_000_000;
 const ASIC_DATA_BAUDRATE: u32 = 5_000_000;
 
 #[repr(C, align(4))]
@@ -89,7 +89,7 @@ async fn main(spawner: Spawner) {
         static RX_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
 
         let mut config = rp_uart::Config::default();
-        config.baudrate = ESP_DATA_BAUD_RATE;
+        config.baudrate = ESP_DATA_BAUDRATE;
 
         rp_uart::BufferedUart::new(p.UART1, Irqs, p.PIN_4, p.PIN_5, TX_BUF.init([0; 4096]), RX_BUF.init([0; 4096]), config)
     };
