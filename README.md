@@ -70,7 +70,7 @@ The bonanza-bridge-fw firmware exposes two hardware UART interfaces to the ESP32
 | Interface | RP2040 Peripheral | RP2040 Pins | Format | Baudrate | Purpose |
 |-----------|-------------------|-------------|--------|----------|---------|
 | Control Serial | UART0 | TX: GPIO0, RX: GPIO1 | 8N1 | 115200 | Fan control and board control commands |
-| Data Serial | UART1 | TX: GPIO4, RX: GPIO5 | 8N1 | 2000000 | ESP32S3-side BIRDS-compatible data stream |
+| Data Serial | UART1 | TX: GPIO4, RX: GPIO5 | 8N1 | 5000000 | ESP32S3-side BIRDS-compatible data stream |
 | ASIC Serial | PIO1 | TX: GPIO8, RX: GPIO9 | 9N1 | 5000000 | BZM2 ASIC-side data stream |
 
 ### Data Serial
@@ -82,9 +82,9 @@ The bonanza-bridge-fw firmware exposes two hardware UART interfaces to the ESP32
   continuously into a naturally aligned 1024-word memory ring, so executor,
   interrupt, ESP command, or UART drain latency cannot stall the eight-entry
   PIO RX FIFO.
-- The ASIC side remains fixed at 5000000 baud. The ESP link uses 2000000 baud,
-  providing more than twelve times the measured raw receive payload budget
-  while improving board-level signal margin.
+- Both the ASIC side and ESP link run at 5000000 baud. The ESP link provides
+  more than thirty times the measured raw receive payload budget and uses an
+  exact RP2040 hardware-UART divider at the 125 MHz peripheral clock.
 
 **ESP32-to-ASIC 9-bit Data Encoding:**
 

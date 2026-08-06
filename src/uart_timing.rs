@@ -9,7 +9,7 @@ pub const ESP_TX_WIRE_BITS_PER_BYTE: u8 = 10;
 pub const ASIC_RX_DMA_RING_WORDS: usize = 1024;
 pub const ASIC_RX_DMA_TRANSFER_COUNT: u32 = 0x7fff_ffff;
 pub const ASIC_RX_DESIGN_WORDS_PER_SECOND: u32 = 16_000;
-pub const ESP_DATA_BAUD_RATE: u32 = 2_000_000;
+pub const ESP_DATA_BAUD_RATE: u32 = 5_000_000;
 pub const QUALIFICATION_SOAK_SECONDS: u32 = 24 * 60 * 60;
 
 /// ASIC output is meaningful only while its I/O rail is enabled and reset is
@@ -73,6 +73,17 @@ mod tests {
     }
 
     #[test]
+    fn esp_data_link_uses_five_mbaud_with_an_exact_hardware_uart_divider() {
+        // Embassy's RP2040 UART driver derives IBRD/FBRD from this scaled
+        // divisor. 200 maps to IBRD=1 and FBRD=36, exactly 5 Mbaud.
+        let scaled_divider = (8 * 125_000_000) / ESP_DATA_BAUD_RATE;
+        assert_eq!(ESP_DATA_BAUD_RATE, 5_000_000);
+        assert_eq!(scaled_divider, 200);
+        assert_eq!(scaled_divider >> 7, 1);
+        assert_eq!(((scaled_divider & 0x7f) + 1) / 2, 36);
+    }
+
+    #[test]
     fn rx_samples_all_nine_bits_at_consistent_eight_cycle_intervals() {
         assert_eq!(rx_data_sample_cycle(0), Some(12));
         assert_eq!(rx_data_sample_cycle(7), Some(68));
@@ -102,7 +113,7 @@ mod tests {
     fn raw_rx_link_covers_the_measured_design_rate() {
         let required_baud = ASIC_RX_DESIGN_WORDS_PER_SECOND * ESP_TX_WIRE_BITS_PER_BYTE as u32;
         assert_eq!(required_baud, 160_000);
-        assert!(required_baud * 12 < ESP_DATA_BAUD_RATE);
+        assert!(required_baud * 30 < ESP_DATA_BAUD_RATE);
     }
 
     #[test]
