@@ -4,7 +4,7 @@ pub const MANIFEST_MAGIC: &[u8; 16] = b"BZM-BRIDGE-FW\0\0\0";
 pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
 pub const MANIFEST_SIZE: usize = 96;
 pub const MANIFEST_CRC_OFFSET: usize = MANIFEST_SIZE - 4;
-pub const TARGET_BOARD_VERSION: u16 = 1002;
+pub const TARGET_BOARD_VERSION: u16 = 1004;
 pub const FIRMWARE_KIND_BRIDGE: u8 = 1;
 pub const VERSION_OFFSET: usize = 24;
 pub const VERSION_CAPACITY: usize = 64;
@@ -80,9 +80,8 @@ mod tests {
         assert_eq!(IMAGE_MANIFEST[20], FIRMWARE_KIND_BRIDGE);
         assert_eq!(IMAGE_MANIFEST[21], PROTOCOL_MAJOR);
         assert_eq!(IMAGE_MANIFEST[22], PROTOCOL_MINOR);
-        // This migration retains the 1002 hardware target, but cannot be
-        // mistaken for the protocol-1 firmware by the ESP image validator.
-        assert_eq!(&IMAGE_MANIFEST[18..23], &[0xea, 0x03, 1, 2, 0]);
+        // Keep both hardware identity and protocol distinct from 1002 images.
+        assert_eq!(&IMAGE_MANIFEST[18..23], &[0xec, 0x03, 1, 3, 0]);
         assert_eq!(IMAGE_MANIFEST[23] as usize, FIRMWARE_VERSION.len());
         assert_eq!(&IMAGE_MANIFEST[VERSION_OFFSET..VERSION_OFFSET + FIRMWARE_VERSION.len()], FIRMWARE_VERSION.as_bytes());
         assert!(IMAGE_MANIFEST[VERSION_OFFSET + FIRMWARE_VERSION.len()..MANIFEST_CRC_OFFSET].iter().all(|byte| *byte == 0));

@@ -53,7 +53,7 @@ jobs:
         run: cargo test --lib --target x86_64-unknown-linux-gnu --locked
 
   firmware-build:
-    name: RP2040 release build
+    name: 1004 RP2040 release build and image validation
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -64,7 +64,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust embedded target
-        run: rustup toolchain install stable --profile minimal --target thumbv6m-none-eabi
+        run: rustup toolchain install stable --profile minimal --target thumbv6m-none-eabi --component clippy,llvm-tools
 
       - name: Cache Cargo dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -78,5 +78,11 @@ jobs:
             ${{ runner.os }}-cargo-rp2040-
             ${{ runner.os }}-cargo-
 
+      - name: Lint RP2040 hardware code
+        run: cargo clippy --bin bonanza-bridge-fw --target thumbv6m-none-eabi --locked -- -D warnings
+
       - name: Build release firmware
         run: cargo build --release --locked
+
+      - name: Package and validate 1004 image identity
+        run: python3 scripts/package_firmware.py

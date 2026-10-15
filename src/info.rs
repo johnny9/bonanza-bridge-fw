@@ -1,9 +1,9 @@
 use heapless::Vec;
 
 pub const INFO_SCHEMA_VERSION: u8 = 1;
-/// Protocol 2 removes the output lease and requires safety status schema 2.
-/// GPIO ownership, serial framing, and raw ASIC RX forwarding remain unchanged.
-pub const PROTOCOL_MAJOR: u8 = 2;
+/// Protocol 3 is the 1004 serial bridge: no board controls or safety lease.
+/// GET_STATUS describes transport health; RESET_STREAM coordinates recovery.
+pub const PROTOCOL_MAJOR: u8 = 3;
 pub const PROTOCOL_MINOR: u8 = 0;
 pub const VERSION_MAX_LENGTH: usize = 63;
 pub const FIRMWARE_VERSION: &str = env!("BRIDGE_FIRMWARE_VERSION");
@@ -47,7 +47,7 @@ mod tests {
         assert_eq!(payload[0], INFO_SCHEMA_VERSION);
         assert_eq!(payload[1], PROTOCOL_MAJOR);
         assert_eq!(payload[2], PROTOCOL_MINOR);
-        assert_eq!(&payload[..3], &[1, 2, 0]);
+        assert_eq!(&payload[..3], &[1, 3, 0]);
         assert_eq!(payload[3] as usize, FIRMWARE_VERSION.len());
         assert_eq!(&payload[4..], FIRMWARE_VERSION.as_bytes());
     }

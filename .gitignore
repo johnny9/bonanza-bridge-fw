@@ -3,3 +3,5 @@ espup
 firmware.uf2
 bonanza-bridge-fw.uf2
 .vscode/
+dist/
+__pycache__/
