@@ -10,7 +10,7 @@ use embassy_rp::{
     uart::{BufferedUart, Error as UartError},
     watchdog::Watchdog,
 };
-use embassy_time::{Duration, Instant, TimeoutError};
+use embassy_time::{Duration, TimeoutError};
 use embedded_io_async::{Read, Write};
 use heapless::Vec;
 
@@ -74,8 +74,8 @@ pub enum CommandError {
 impl From<SafetyError> for CommandError {
     fn from(error: SafetyError) -> Self {
         match error {
-            SafetyError::LeaseExpired | SafetyError::FaultLatched | SafetyError::TripActive => Self::Fault,
-            SafetyError::LeaseRequired | SafetyError::InvalidSequence | SafetyError::FanNotSafe | SafetyError::InvalidFanPercent => Self::Denied,
+            SafetyError::FaultLatched | SafetyError::TripActive => Self::Fault,
+            SafetyError::InvalidSequence | SafetyError::FanNotSafe | SafetyError::InvalidFanPercent => Self::Denied,
         }
     }
 }
@@ -134,14 +134,9 @@ impl Controller {
         }
     }
 
-    fn now_ms() -> u64 {
-        Instant::now().as_millis()
-    }
-
     fn service_safety(&mut self) {
-        let now_ms = Self::now_ms();
         let trip_input_asserted = self.gpio.asic_trip.is_high();
-        self.safety.tick(now_ms, trip_input_asserted);
+        self.safety.sample_trip_input(trip_input_asserted);
         self.apply_safety_outputs();
         // This is the only watchdog feed site. A stalled control/safety task
         // therefore resets the RP2040 back to its safe boot pin levels.
@@ -154,69 +149,55 @@ impl Controller {
             return;
         }
 
-        let forward_asic_rx = bonanza_bridge_fw::uart_timing::asic_rx_forwarding_allowed(outputs.five_volt_enabled, outputs.asic_reset_asserted);
-        if !forward_asic_rx {
+        let rx_gate_change = bonanza_bridge_fw::uart_timing::asic_rx_forwarding_change(self.applied_outputs, outputs);
+        if rx_gate_change == Some(false) {
             set_buffered_rx_forwarding_enabled(false);
         }
         let intent = outputs.board_control_intent();
         self.gpio.v5_en.set_level(intent.five_volt_enable_high.into());
         self.gpio.asic_rst.set_level(intent.asic_reset_n_high.into());
         fan::apply_percent(&mut self.fan.pwm, intent.fan_percent);
-        if forward_asic_rx {
+        if rx_gate_change == Some(true) {
             set_buffered_rx_forwarding_enabled(true);
         }
         self.applied_outputs = Some(outputs);
     }
 
     fn safety_status_payload(&self) -> Vec<u8, 256> {
-        let encoded = self.safety.status(Self::now_ms()).encode();
+        let encoded = self.safety.status().encode();
         Vec::from_slice(encoded.as_slice()).unwrap()
-    }
-
-    fn safety_arm(&mut self) -> Result<(), SafetyError> {
-        self.service_safety();
-        let result = self.safety.arm(Self::now_ms());
-        self.apply_safety_outputs();
-        result
-    }
-
-    fn safety_heartbeat(&mut self) -> Result<(), SafetyError> {
-        self.service_safety();
-        let result = self.safety.heartbeat(Self::now_ms());
-        self.apply_safety_outputs();
-        result
     }
 
     fn safety_clear_fault(&mut self) -> Result<(), SafetyError> {
         self.service_safety();
-        let result = self.safety.clear_fault(Self::now_ms());
+        let result = self.safety.clear_fault();
         self.apply_safety_outputs();
         result
     }
 
-    fn safety_disarm(&mut self) {
+    fn safety_safe_off(&mut self) {
         self.service_safety();
-        self.safety.disarm();
+        self.safety.safe_off();
         self.apply_safety_outputs();
     }
 
     fn safety_request_five_volt_enabled(&mut self, enabled: bool) -> Result<(), SafetyError> {
         self.service_safety();
-        let result = self.safety.request_five_volt_enabled(enabled, Self::now_ms());
+        let result = self.safety.request_five_volt_enabled(enabled);
         self.apply_safety_outputs();
         result
     }
 
     fn safety_request_asic_reset_asserted(&mut self, asserted: bool) -> Result<(), SafetyError> {
         self.service_safety();
-        let result = self.safety.request_asic_reset_asserted(asserted, Self::now_ms());
+        let result = self.safety.request_asic_reset_asserted(asserted);
         self.apply_safety_outputs();
         result
     }
 
     fn safety_request_fan_percent(&mut self, percent: u8) -> Result<(), SafetyError> {
         self.service_safety();
-        let result = self.safety.request_fan_percent(percent, Self::now_ms());
+        let result = self.safety.request_fan_percent(percent);
         self.apply_safety_outputs();
         result
     }

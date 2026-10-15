@@ -80,6 +80,9 @@ mod tests {
         assert_eq!(IMAGE_MANIFEST[20], FIRMWARE_KIND_BRIDGE);
         assert_eq!(IMAGE_MANIFEST[21], PROTOCOL_MAJOR);
         assert_eq!(IMAGE_MANIFEST[22], PROTOCOL_MINOR);
+        // This migration retains the 1002 hardware target, but cannot be
+        // mistaken for the protocol-1 firmware by the ESP image validator.
+        assert_eq!(&IMAGE_MANIFEST[18..23], &[0xea, 0x03, 1, 2, 0]);
         assert_eq!(IMAGE_MANIFEST[23] as usize, FIRMWARE_VERSION.len());
         assert_eq!(&IMAGE_MANIFEST[VERSION_OFFSET..VERSION_OFFSET + FIRMWARE_VERSION.len()], FIRMWARE_VERSION.as_bytes());
         assert!(IMAGE_MANIFEST[VERSION_OFFSET + FIRMWARE_VERSION.len()..MANIFEST_CRC_OFFSET].iter().all(|byte| *byte == 0));

@@ -4,6 +4,11 @@ bonanza-bridge-fw is RP2040 passthrough firmware for communicating with ASICs an
 
 This firmware targets the [bitaxeBonanza-1002x](https://github.com/bitaxeorg/bitaxeBonanza/tree/1002x).
 
+This branch implements protocol **2.0**, the no-lease firmware for **1002**.
+The source baseline before this change is tagged `1002-lease-working-20261006`
+(`dd480dd`). GPIO ownership remains on the RP2040. The existing protocol-1 ESP
+firmware needs a matching update before it can use this build.
+
 The local output interlock, host responsibilities, failure behavior, and
 hardware limitations are documented in
 [Bridge safety interlock](docs/safety-interlock.md).
@@ -172,7 +177,7 @@ The get-info response payload is:
 |---|---|---|---|---|
 | Schema version | Protocol major | Protocol minor | Version length | Version string |
 
-- The current schema version is `1` and the control protocol version is `1.0`.
+- The current schema version is `1` and the control protocol version is `2.0`.
 - The version string is printable ASCII and no more than 63 bytes.
 - By default, builds report `<package-version>+g<short-git-sha>`, followed by `.dirty` when built from a modified checkout.
 - Manufacturers can set `BONANZA_BRIDGE_FW_VERSION` at build time to use a release version instead.
@@ -203,9 +208,11 @@ than 100 complete TDM frames, reports exact overwrite loss, and its transfer
 counter covers a 24-hour qualification run at the measured design rate. The RX
 state machine and DMA channel are enabled only while 5 V is on and ASIC reset is
 released; every safe transition synchronously aborts DMA, drains the FIFO, and
-restores the program counter to its start-bit wait before the next controlled
-session. This prevents an unpowered low RX line from manufacturing bytes,
-mixing powered sessions, or starving control/safety work.
+restores the program counter to its start-bit wait before the next enable.
+There is no serial session or host timeout. Fan-only changes leave RX DMA and
+its counters intact. This receive gate follows the bridge-owned 1002 GPIOs;
+an always-active receiver for boards with ESP-owned GPIOs is a separate change.
+This gate is not a full end-to-end flush of the UART buffers or TX pair decoder.
 
 Example request with command ID `0x2a`:
 
@@ -213,7 +220,7 @@ Example request with command ID `0x2a`:
 
 Example response for version `1.2.3`:
 
-`0c 00 2a 01 01 03 05 31 2e 32 2e 33`
+`0c 00 2a 01 02 00 05 31 2e 32 2e 33`
 
 The get-RX-stats response is fixed-width and little-endian:
 
@@ -231,70 +238,74 @@ Example zero-counter response:
 
 `0c 00 2a 01 00 00 00 00 00 00 00 00`
 
-### Production bridge safety policy
+### No-lease 1002 output policy
 
-This is a local output interlock, not a physical rail monitor or a fully
-independent hardware safety controller. Its purpose is to keep the outputs
-owned by the RP2040 fail-closed when the ESP stops controlling them, the ASIC
-trip input asserts, or the Bridge control task stalls. See
-[Bridge safety interlock](docs/safety-interlock.md) for the state machine and
-host integration sequence.
+The bridge retains 5 V enable (GPIO18), ASIC reset (GPIO11), active-high trip
+(GPIO10), fan PWM (GPIO20), and fan tach (GPIO21). GPIO and fan commands retain
+their existing control-UART pages and payloads.
 
-The bridge always boots with these semantic requests before it accepts control commands:
+Before accepting commands, the bridge requests:
 
-- 5 V disabled
-- ASIC reset asserted (`ASIC_RST/RST_N` is driven low)
-- fan requested at 100 percent
+- 5 V disabled;
+- ASIC reset asserted (`ASIC_RST/RST_N` low); and
+- fan at 100 percent.
 
-The production policy is fixed in source: the local output lease is 2000 ms and
-the active-high ASIC trip input is latched. There is no build-time mode that
-can disable either protection. Unsafe GPIO or fan changes are denied until the
-ESP arms the bridge. The ESP must then heartbeat inside the lease, and must
-disarm for a healthy shutdown. Lease expiry or an asserted trip immediately
-requests the safe outputs above and latches a fault; a heartbeat cannot clear
-or resurrect that fault.
+GPIO commands work directly without `ARM`, heartbeat, or a serial session.
+Requested outputs persist when ESP control traffic stops. Status polling is
+optional and never renews a timer. The active-high trip input still latches a
+fault and restores the safe output request. `CLEAR_FAULT` requires trip low
+and leaves the outputs safe; restarting then uses ordinary ordered GPIO writes.
 
-The RP2040 hardware watchdog is enabled with a three-second timeout and is fed
-only after the control task samples trip/lease state and applies effective
-outputs. UART response writes are bounded to 100 ms, and the 500 ms tach
-measurement services safety at least every 10 ms. A watchdog reset restarts
-the firmware into the same safe boot pin requests.
+The three-second RP2040 watchdog remains enabled. Only the control task feeds
+it, after sampling trip and applying outputs. Control response writes remain
+bounded to 100 ms; tach measurements service safety every 10 ms. A stalled
+control task therefore causes firmware restart into safe boot initialization.
+See [Bridge safety interlock](docs/safety-interlock.md) for host sequencing and
+hardware limits.
 
-Legacy ESP firmware that does not implement protocol 1 can still request safe
-outputs, but its attempt to enable 5 V is denied with `0x12`.
-
-Safety commands use system page `0x00`:
+Safety commands use system page `0x00` and have no request payload:
 
 | Command | Value | Response |
 |---|---:|---|
-| Get safety status | `0x10` | Current 17-byte safety status |
-| Arm safety lease | `0x11` | Arms from safe outputs and returns status |
-| Safety heartbeat | `0x12` | Renews an armed lease and returns status |
-| Clear safety fault | `0x13` | Clears only with trip low, returns to safe-off, and returns status |
-| Disarm safety lease | `0x14` | Requests safe outputs, ends a healthy lease, preserves any latched fault, and returns status |
+| Get safety status | `0x10` | 13-byte schema-2 status |
+| Former arm lease | `0x11` | Invalid-command error `0x11`; opcode reserved |
+| Former heartbeat | `0x12` | Invalid-command error `0x11`; opcode reserved |
+| Clear safety fault | `0x13` | Requires trip low, restores safe outputs, returns status |
+| Safe off | `0x14` | Restores safe outputs, preserves any latched fault, returns status |
+
+`0x14` retains the safe-output action of the former disarm command. It does not
+create or end a serial session. Successful `0x13` and `0x14` responses use the
+same status schema as `0x10`.
 
 Example get-status request with command ID `0x2a`:
 
 `06 00 2a 00 00 10`
 
-The response payload is fixed-width and little-endian where a field uses multiple bytes:
+Status is little-endian for fields wider than one byte:
 
 | Offset | Size | Field |
 |---:|---:|---|
-| 0 | 1 | Status schema, currently `1` |
-| 1 | 1 | Safety policy: fixed at `2` (lease plus trip-latch) |
-| 2 | 1 | State: `0` safe-off, `1` controlled, `2` fault-latched |
-| 3 | 1 | Fault: `0` none, `1` lease-expired, `2` ASIC-trip |
-| 4 | 1 | Runtime verdict: `0` good-safe-off, `1` good-controlled, `0x80` bad-fault, `0x81` bad-lease, `0x82` bad-trip-input, `0x83` bad-unsafe-outputs |
-| 5 | 1 | Production verdict: `0` good, `0x80` stage-disabled, `0x81` capability-gap, `0x82` bad-runtime |
+| 0 | 1 | Status schema `2` |
+| 1 | 1 | Policy `3`: 1002 trip latch without lease |
+| 2 | 1 | State: `0` safe-off, `1` controlled outputs, `2` fault-latched |
+| 3 | 1 | Fault: `0` none, `2` ASIC-trip; old lease-expired value `1` reserved |
+| 4 | 1 | Runtime: `0` good-safe-off, `1` good-controlled, `0x80` bad-fault, `0x82` bad-trip-input, `0x83` bad-unsafe-outputs |
+| 5 | 1 | Production: `0` good, `0x81` capability-gap, `0x82` bad-runtime |
 | 6 | 2 | Capability bits |
 | 8 | 2 | Evidence bits |
-| 10 | 4 | Lease milliseconds remaining |
-| 14 | 1 | Effective command flags: bit 0 = 5 V enabled, bit 1 = reset asserted, bit 2 = fan at 100 percent |
-| 15 | 1 | Effective commanded fan percentage |
-| 16 | 1 | Sampled trip input, `0` or `1` |
+| 10 | 1 | Output flags: bit 0 = 5 V enabled, bit 1 = reset asserted, bit 2 = fan at 100 percent |
+| 11 | 1 | Commanded fan percentage |
+| 12 | 1 | Sampled trip input, `0` or `1` |
 
-Capability and matching evidence bits are:
+There is no lease-remaining field. State describes the effective outputs and
+fault, not host authorization. `CONTROLLED` means at least one output differs
+from the safe request, including a reduced fan command while 5 V is off.
+
+Example healthy safe-off response (16 bytes including framing):
+
+`10 00 2a 02 03 00 00 00 81 8f 00 0d 00 06 64 00`
+
+Capability bits retain their previous meanings:
 
 | Bit | Capability | Current firmware |
 |---:|---|---|
@@ -302,34 +313,39 @@ Capability and matching evidence bits are:
 | 1 | ASIC reset control path | Set |
 | 2 | Full-fan command path | Set |
 | 3 | Trip input sampled by the control task | Set |
-| 4 | Independent VCORE cutoff | **Not set** |
-| 5 | Autonomous fan-tach interlock | **Not set** |
-| 6 | Trip monitor independent of the command task | **Not set** |
-| 7 | Controlled fan speed while powered | Set |
+| 4 | Independent VCORE cutoff | Not set |
+| 5 | Autonomous fan-tach interlock | Not set |
+| 6 | Trip monitor independent of the command task | Not set |
+| 7 | Controlled fan speed | Set |
 
-Evidence bits 0 through 3 mean outputs-safe, lease-valid, trip-clear, and
-fault-clear. Evidence bits 4 through 6 mirror the three independent hardware
-capabilities above. The current firmware capability value is `0x008f`, so a
-healthy status reports production verdict `0x81` (capability gap). This field
-is retained for protocol compatibility and must not be changed without the
-corresponding hardware integration and tests.
+Evidence bits 0, 2, and 3 mean outputs-safe, trip-clear, and fault-clear.
+**Bit 1 (formerly lease-valid) is reserved and always clear.** Bits 4 through 6
+mirror the independent hardware capabilities above. The current capability
+value remains `0x008f`, so a healthy bridge reports production verdict `0x81`
+(capability gap). This is separate from its runtime verdict.
 
-Status reports effective command state, not physical rail measurements. A host
-that requires VCORE, PGOOD, fan-tach, or temperature protection must measure and
-act on those signals separately.
+Status reports effective commands, not physical rail measurements. The ESP
+still owns VCORE, PGOOD, temperature, tachometer, and minimum-speed supervision.
 
 ### ESP compatibility
 
-| Bridge protocol | ESP-Miner behavior |
-|---|---|
-| Missing info | Rejected before board power is enabled |
-| 1.0 or newer compatible minor | Supported; raw RX bytes plus `GET_RX_STATS` |
-| Major version other than 1 | Rejected before board power is enabled |
+This firmware and its image manifest advertise protocol **2.0** and target
+board **1002**. The manifest and get-info schemas remain `1`; the safety-status
+schema changes to `2`.
 
-The Bonanza MVO ESP firmware requires protocol 1.0 or newer within major
-version 1. It verifies the info schema, raw RX stats command, safety status
-coherence, lease, trip-clear state, reset, 5 V, full-fan command, and live fan
-tach before releasing ASIC reset.
+The current ESP-Miner Bonanza code accepts major 1 and requires lease evidence.
+It will reject this build. Its paired update must:
+
+- recognize protocol 2 and decode the 13-byte status layout;
+- remove arm, heartbeat, lease expiry, and lease-valid startup checks;
+- retain trip, output, rail, temperature, and tach checks;
+- retain GPIO/fan commands on the bridge for 1002;
+- use safe-off during shutdown and establish safe outputs before a new startup;
+- update bridge image validation to accept the intended protocol-2 image.
+
+The existing protocol-1 decoder and updater must not simply bypass their
+version checks. Protocol-1 and protocol-2 firmware have different control and
+status contracts.
 
 **GPIO**
 
@@ -352,7 +368,7 @@ Example:
 The GPIO API exposes the electrical `asic_rst` pin level for compatibility.
 Because this signal is `RST_N`, writing or reading `0` means reset is asserted.
 Deasserting reset requires 5 V already enabled, and enabling 5 V requires reset
-asserted, a live lease, and the fan command at 100 percent.
+asserted and the fan command at 100 percent. No arm command is required.
 
 **Fan**
 
@@ -371,7 +387,7 @@ Example:
 - Set fan speed to 100%: `07 00 00 00 09 10 64`
 - Read fan tach (RPM):   `06 00 00 00 09 20`
 
-The fan must be at 100% before enabling 5 V. Once the bridge is controlled
-under a live lease, the host may apply a lower running target and is
-responsible for temperature, tachometer, and minimum-speed supervision.
-Disabling 5 V, disarming, lease expiry, or an ASIC trip restores 100%.
+The fan must be at 100% before enabling 5 V. The host may apply a lower running
+target and remains responsible for temperature, tachometer, and minimum-speed
+supervision. Disabling 5 V, safe-off, clearing a fault, or an ASIC trip restores
+100%. Host silence leaves the requested target unchanged.

@@ -13,10 +13,8 @@ pub enum Command {
     GetInfo,
     GetRxStats,
     GetSafetyStatus,
-    ArmSafetyLease,
-    SafetyHeartbeat,
     ClearSafetyFault,
-    DisarmSafety,
+    SafeOff,
 }
 
 impl Command {
@@ -26,10 +24,8 @@ impl Command {
             [0x02] => Ok(Self::GetRxStats),
             _ => match decode_wire_command(buf) {
                 Some(SafetyWireCommand::GetStatus) => Ok(Self::GetSafetyStatus),
-                Some(SafetyWireCommand::ArmLease) => Ok(Self::ArmSafetyLease),
-                Some(SafetyWireCommand::Heartbeat) => Ok(Self::SafetyHeartbeat),
                 Some(SafetyWireCommand::ClearFault) => Ok(Self::ClearSafetyFault),
-                Some(SafetyWireCommand::Disarm) => Ok(Self::DisarmSafety),
+                Some(SafetyWireCommand::SafeOff) => Ok(Self::SafeOff),
                 None => Err(CommandError::Invalid),
             },
         }
@@ -46,20 +42,12 @@ impl ControllerCommand for Command {
                 Ok(Vec::from_slice(encoded.as_slice()).unwrap())
             }
             Command::GetSafetyStatus => Ok(controller.safety_status_payload()),
-            Command::ArmSafetyLease => {
-                controller.safety_arm().map_err(CommandError::from)?;
-                Ok(controller.safety_status_payload())
-            }
-            Command::SafetyHeartbeat => {
-                controller.safety_heartbeat().map_err(CommandError::from)?;
-                Ok(controller.safety_status_payload())
-            }
             Command::ClearSafetyFault => {
                 controller.safety_clear_fault().map_err(CommandError::from)?;
                 Ok(controller.safety_status_payload())
             }
-            Command::DisarmSafety => {
-                controller.safety_disarm();
+            Command::SafeOff => {
+                controller.safety_safe_off();
                 Ok(controller.safety_status_payload())
             }
         }

@@ -1,26 +1,25 @@
 use heapless::Vec;
 
-pub const SAFETY_STATUS_SCHEMA_VERSION: u8 = 1;
-pub const SAFETY_STATUS_ENCODED_LEN: usize = 17;
-pub const PRODUCTION_LEASE_TIMEOUT_MS: u32 = 2_000;
+pub const SAFETY_STATUS_SCHEMA_VERSION: u8 = 2;
+pub const SAFETY_STATUS_ENCODED_LEN: usize = 13;
+/// Policy identifier 3 retains the 1002 trip latch without a host lease.
+/// Identifiers 0..=2 belonged to the protocol-1 policies.
+pub const SAFETY_POLICY_TRIP_LATCH_NO_LEASE: u8 = 3;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SafetyWireCommand {
     GetStatus = 0x10,
-    ArmLease = 0x11,
-    Heartbeat = 0x12,
     ClearFault = 0x13,
-    Disarm = 0x14,
+    SafeOff = 0x14,
 }
 
 pub fn decode_wire_command(bytes: &[u8]) -> Option<SafetyWireCommand> {
     match bytes {
         [0x10] => Some(SafetyWireCommand::GetStatus),
-        [0x11] => Some(SafetyWireCommand::ArmLease),
-        [0x12] => Some(SafetyWireCommand::Heartbeat),
+        // Former ARM and HEARTBEAT opcodes stay reserved, not successful no-ops.
         [0x13] => Some(SafetyWireCommand::ClearFault),
-        [0x14] => Some(SafetyWireCommand::Disarm),
+        [0x14] => Some(SafetyWireCommand::SafeOff),
         _ => None,
     }
 }
@@ -35,7 +34,7 @@ pub const CAP_INDEPENDENT_TRIP_MONITOR: u16 = 1 << 6;
 pub const CAP_FAN_CONTROLLED_SPEED: u16 = 1 << 7;
 
 pub const EVIDENCE_OUTPUTS_SAFE: u16 = 1 << 0;
-pub const EVIDENCE_LEASE_VALID: u16 = 1 << 1;
+// Evidence bit 1 was LEASE_VALID in schema 1; it remains reserved and clear.
 pub const EVIDENCE_TRIP_CLEAR: u16 = 1 << 2;
 pub const EVIDENCE_FAULT_CLEAR: u16 = 1 << 3;
 pub const EVIDENCE_CORE_CUTOFF_AVAILABLE: u16 = 1 << 4;
@@ -43,24 +42,6 @@ pub const EVIDENCE_FAN_TACH_INTERLOCK_AVAILABLE: u16 = 1 << 5;
 pub const EVIDENCE_INDEPENDENT_TRIP_MONITOR_AVAILABLE: u16 = 1 << 6;
 
 const REQUIRED_PRODUCTION_CAPABILITIES: u16 = CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED | CAP_CORE_POWER_CUTOFF | CAP_FAN_TACH_INTERLOCK | CAP_INDEPENDENT_TRIP_MONITOR | CAP_FAN_CONTROLLED_SPEED;
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SafetyStage {
-    BootSafe = 0,
-    Lease = 1,
-    TripLatch = 2,
-}
-
-impl SafetyStage {
-    pub const fn enforces_lease(self) -> bool {
-        matches!(self, Self::Lease | Self::TripLatch)
-    }
-
-    pub const fn enforces_trip_latch(self) -> bool {
-        matches!(self, Self::TripLatch)
-    }
-}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,7 +55,7 @@ pub enum SafetyState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultReason {
     None = 0,
-    LeaseExpired = 1,
+    // Value 1 is reserved for the removed LEASE_EXPIRED fault.
     AsicTrip = 2,
 }
 
@@ -84,7 +65,6 @@ pub enum RuntimeVerdict {
     GoodSafeOff = 0,
     GoodControlled = 1,
     BadFault = 0x80,
-    BadLease = 0x81,
     BadTripInput = 0x82,
     BadUnsafeOutputs = 0x83,
 }
@@ -93,15 +73,12 @@ pub enum RuntimeVerdict {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductionVerdict {
     Good = 0,
-    BadStageDisabled = 0x80,
     BadCapabilityGap = 0x81,
     BadRuntime = 0x82,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SafetyError {
-    LeaseRequired,
-    LeaseExpired,
     FaultLatched,
     TripActive,
     InvalidSequence,
@@ -111,19 +88,14 @@ pub enum SafetyError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SafetyConfig {
-    pub stage: SafetyStage,
-    pub lease_timeout_ms: u32,
     pub capabilities: u16,
 }
 
 impl SafetyConfig {
     pub const fn firmware() -> Self {
         Self {
-            // Production images always enforce both the local output lease
-            // and the active-high trip latch. Qualification-only build modes
-            // must not be able to weaken this policy.
-            stage: SafetyStage::TripLatch,
-            lease_timeout_ms: PRODUCTION_LEASE_TIMEOUT_MS,
+            // The active-high trip latch is unconditional. Host silence does
+            // not expire the requested outputs or authorize a new session.
             // These describe only the control paths implemented by this firmware.
             // Independent VCORE cutoff, tach interlock, and independent trip
             // monitoring are deliberately absent until hardware proves them.
@@ -173,14 +145,12 @@ pub const fn fan_pwm_compare(percent: u8) -> u16 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SafetyStatus {
-    pub stage: SafetyStage,
     pub state: SafetyState,
     pub fault: FaultReason,
     pub runtime_verdict: RuntimeVerdict,
     pub production_verdict: ProductionVerdict,
     pub capabilities: u16,
     pub evidence: u16,
-    pub lease_remaining_ms: u32,
     pub outputs: SafetyOutputs,
     pub trip_input_asserted: bool,
 }
@@ -189,11 +159,17 @@ impl SafetyStatus {
     pub fn encode(self) -> Vec<u8, 32> {
         let mut payload = Vec::new();
         payload
-            .extend_from_slice(&[SAFETY_STATUS_SCHEMA_VERSION, self.stage as u8, self.state as u8, self.fault as u8, self.runtime_verdict as u8, self.production_verdict as u8])
+            .extend_from_slice(&[
+                SAFETY_STATUS_SCHEMA_VERSION,
+                SAFETY_POLICY_TRIP_LATCH_NO_LEASE,
+                self.state as u8,
+                self.fault as u8,
+                self.runtime_verdict as u8,
+                self.production_verdict as u8,
+            ])
             .unwrap();
         payload.extend_from_slice(&self.capabilities.to_le_bytes()).unwrap();
         payload.extend_from_slice(&self.evidence.to_le_bytes()).unwrap();
-        payload.extend_from_slice(&self.lease_remaining_ms.to_le_bytes()).unwrap();
 
         let output_flags = u8::from(self.outputs.five_volt_enabled) | (u8::from(self.outputs.asic_reset_asserted) << 1) | (u8::from(self.outputs.fan_percent == 100) << 2);
         payload.extend_from_slice(&[output_flags, self.outputs.fan_percent, u8::from(self.trip_input_asserted)]).unwrap();
@@ -205,22 +181,18 @@ impl SafetyStatus {
 #[derive(Debug)]
 pub struct SafetyPolicy {
     config: SafetyConfig,
-    state: SafetyState,
     fault: FaultReason,
     requested_outputs: SafetyOutputs,
     trip_input_asserted: bool,
-    lease_deadline_ms: Option<u64>,
 }
 
 impl SafetyPolicy {
     pub const fn new(config: SafetyConfig) -> Self {
         Self {
             config,
-            state: SafetyState::SafeOff,
             fault: FaultReason::None,
             requested_outputs: SafetyOutputs::SAFE,
             trip_input_asserted: false,
-            lease_deadline_ms: None,
         }
     }
 
@@ -229,95 +201,52 @@ impl SafetyPolicy {
     }
 
     pub const fn outputs(&self) -> SafetyOutputs {
-        if matches!(self.state, SafetyState::FaultLatched) {
-            SafetyOutputs::SAFE
-        } else {
+        if matches!(self.fault, FaultReason::None) {
             self.requested_outputs
+        } else {
+            SafetyOutputs::SAFE
         }
     }
 
-    pub fn tick(&mut self, now_ms: u64, trip_input_asserted: bool) {
+    pub fn sample_trip_input(&mut self, trip_input_asserted: bool) {
         self.trip_input_asserted = trip_input_asserted;
-
-        if !matches!(self.state, SafetyState::FaultLatched) && self.config.stage.enforces_trip_latch() && trip_input_asserted {
+        if trip_input_asserted {
             self.latch_fault(FaultReason::AsicTrip);
-            return;
-        }
-
-        if !matches!(self.state, SafetyState::Controlled) || !self.config.stage.enforces_lease() {
-            return;
-        }
-
-        if self.lease_deadline_ms.is_some_and(|deadline| now_ms >= deadline) {
-            self.latch_fault(FaultReason::LeaseExpired);
         }
     }
 
-    pub fn arm(&mut self, now_ms: u64) -> Result<(), SafetyError> {
-        self.tick(now_ms, self.trip_input_asserted);
-        self.ensure_not_faulted()?;
-        if self.config.stage.enforces_trip_latch() && self.trip_input_asserted {
-            return Err(SafetyError::TripActive);
-        }
-
-        self.requested_outputs = SafetyOutputs::SAFE;
-        self.state = SafetyState::Controlled;
-        self.lease_deadline_ms = self.config.stage.enforces_lease().then_some(now_ms.saturating_add(self.config.lease_timeout_ms as u64));
-        Ok(())
-    }
-
-    pub fn heartbeat(&mut self, now_ms: u64) -> Result<(), SafetyError> {
-        self.tick(now_ms, self.trip_input_asserted);
-        self.ensure_not_faulted()?;
-        if !matches!(self.state, SafetyState::Controlled) {
-            return Err(SafetyError::LeaseRequired);
-        }
-
-        if self.config.stage.enforces_lease() {
-            self.lease_deadline_ms = Some(now_ms.saturating_add(self.config.lease_timeout_ms as u64));
-        }
-        Ok(())
-    }
-
-    pub fn request_five_volt_enabled(&mut self, enabled: bool, now_ms: u64) -> Result<(), SafetyError> {
-        self.tick(now_ms, self.trip_input_asserted);
+    pub fn request_five_volt_enabled(&mut self, enabled: bool) -> Result<(), SafetyError> {
         if !enabled {
-            self.requested_outputs.five_volt_enabled = false;
-            self.requested_outputs.asic_reset_asserted = true;
-            self.requested_outputs.fan_percent = 100;
+            self.safe_off();
             return Ok(());
         }
 
-        self.ensure_controlled(now_ms)?;
-        if self.config.stage.enforces_lease() {
-            if self.requested_outputs.fan_percent != 100 {
-                return Err(SafetyError::FanNotSafe);
-            }
-            if !self.requested_outputs.asic_reset_asserted {
-                return Err(SafetyError::InvalidSequence);
-            }
+        self.ensure_not_faulted()?;
+        if self.requested_outputs.fan_percent != 100 {
+            return Err(SafetyError::FanNotSafe);
+        }
+        if !self.requested_outputs.asic_reset_asserted {
+            return Err(SafetyError::InvalidSequence);
         }
         self.requested_outputs.five_volt_enabled = true;
         Ok(())
     }
 
-    pub fn request_asic_reset_asserted(&mut self, asserted: bool, now_ms: u64) -> Result<(), SafetyError> {
-        self.tick(now_ms, self.trip_input_asserted);
+    pub fn request_asic_reset_asserted(&mut self, asserted: bool) -> Result<(), SafetyError> {
         if asserted {
             self.requested_outputs.asic_reset_asserted = true;
             return Ok(());
         }
 
-        self.ensure_controlled(now_ms)?;
-        if self.config.stage.enforces_lease() && !self.requested_outputs.five_volt_enabled {
+        self.ensure_not_faulted()?;
+        if !self.requested_outputs.five_volt_enabled {
             return Err(SafetyError::InvalidSequence);
         }
         self.requested_outputs.asic_reset_asserted = false;
         Ok(())
     }
 
-    pub fn request_fan_percent(&mut self, percent: u8, now_ms: u64) -> Result<(), SafetyError> {
-        self.tick(now_ms, self.trip_input_asserted);
+    pub fn request_fan_percent(&mut self, percent: u8) -> Result<(), SafetyError> {
         if percent > 100 {
             return Err(SafetyError::InvalidFanPercent);
         }
@@ -326,43 +255,39 @@ impl SafetyPolicy {
             return Ok(());
         }
 
-        self.ensure_controlled(now_ms)?;
+        self.ensure_not_faulted()?;
         self.requested_outputs.fan_percent = percent;
         Ok(())
     }
 
-    pub fn clear_fault(&mut self, now_ms: u64) -> Result<(), SafetyError> {
+    pub fn clear_fault(&mut self) -> Result<(), SafetyError> {
         if self.trip_input_asserted {
             return Err(SafetyError::TripActive);
         }
 
-        self.state = SafetyState::SafeOff;
         self.fault = FaultReason::None;
         self.requested_outputs = SafetyOutputs::SAFE;
-        self.lease_deadline_ms = None;
-        self.tick(now_ms, false);
         Ok(())
     }
 
-    pub fn disarm(&mut self) {
+    pub fn safe_off(&mut self) {
         self.requested_outputs = SafetyOutputs::SAFE;
-        self.lease_deadline_ms = None;
-        if matches!(self.fault, FaultReason::None) {
-            self.state = SafetyState::SafeOff;
-        }
     }
 
-    pub fn status(&self, now_ms: u64) -> SafetyStatus {
+    pub fn status(&self) -> SafetyStatus {
         let outputs = self.outputs();
-        let lease_remaining_ms = self.lease_deadline_ms.map(|deadline| deadline.saturating_sub(now_ms).min(u32::MAX as u64) as u32).unwrap_or(0);
-        let lease_valid = !self.config.stage.enforces_lease() || (matches!(self.state, SafetyState::Controlled) && lease_remaining_ms > 0);
+        // State describes effective outputs; it is not host authorization.
+        let state = if !matches!(self.fault, FaultReason::None) {
+            SafetyState::FaultLatched
+        } else if outputs.is_safe() {
+            SafetyState::SafeOff
+        } else {
+            SafetyState::Controlled
+        };
 
         let mut evidence = 0;
         if outputs.is_safe() {
             evidence |= EVIDENCE_OUTPUTS_SAFE;
-        }
-        if lease_valid {
-            evidence |= EVIDENCE_LEASE_VALID;
         }
         if !self.trip_input_asserted {
             evidence |= EVIDENCE_TRIP_CLEAR;
@@ -384,21 +309,17 @@ impl SafetyPolicy {
             RuntimeVerdict::BadFault
         } else if self.trip_input_asserted {
             RuntimeVerdict::BadTripInput
-        } else if matches!(self.state, SafetyState::SafeOff) {
+        } else if matches!(state, SafetyState::SafeOff) {
             if outputs.is_safe() {
                 RuntimeVerdict::GoodSafeOff
             } else {
                 RuntimeVerdict::BadUnsafeOutputs
             }
-        } else if self.config.stage.enforces_lease() && !lease_valid {
-            RuntimeVerdict::BadLease
         } else {
             RuntimeVerdict::GoodControlled
         };
 
-        let production_verdict = if !self.config.stage.enforces_trip_latch() {
-            ProductionVerdict::BadStageDisabled
-        } else if !matches!(runtime_verdict, RuntimeVerdict::GoodSafeOff | RuntimeVerdict::GoodControlled) {
+        let production_verdict = if !matches!(runtime_verdict, RuntimeVerdict::GoodSafeOff | RuntimeVerdict::GoodControlled) {
             ProductionVerdict::BadRuntime
         } else if self.config.capabilities & REQUIRED_PRODUCTION_CAPABILITIES != REQUIRED_PRODUCTION_CAPABILITIES {
             ProductionVerdict::BadCapabilityGap
@@ -407,47 +328,28 @@ impl SafetyPolicy {
         };
 
         SafetyStatus {
-            stage: self.config.stage,
-            state: self.state,
+            state,
             fault: self.fault,
             runtime_verdict,
             production_verdict,
             capabilities: self.config.capabilities,
             evidence,
-            lease_remaining_ms,
             outputs,
             trip_input_asserted: self.trip_input_asserted,
         }
     }
 
-    fn ensure_controlled(&mut self, now_ms: u64) -> Result<(), SafetyError> {
-        self.ensure_not_faulted()?;
-        if matches!(self.state, SafetyState::SafeOff) {
-            if self.config.stage.enforces_lease() {
-                return Err(SafetyError::LeaseRequired);
-            }
-            self.state = SafetyState::Controlled;
-        }
-        if self.config.stage.enforces_lease() && self.lease_deadline_ms.is_none_or(|deadline| now_ms >= deadline) {
-            self.latch_fault(FaultReason::LeaseExpired);
-            return Err(SafetyError::LeaseExpired);
-        }
-        Ok(())
-    }
-
     fn ensure_not_faulted(&self) -> Result<(), SafetyError> {
-        if matches!(self.state, SafetyState::FaultLatched) {
-            Err(SafetyError::FaultLatched)
-        } else {
+        if matches!(self.fault, FaultReason::None) {
             Ok(())
+        } else {
+            Err(SafetyError::FaultLatched)
         }
     }
 
     fn latch_fault(&mut self, reason: FaultReason) {
-        self.state = SafetyState::FaultLatched;
         self.fault = reason;
         self.requested_outputs = SafetyOutputs::SAFE;
-        self.lease_deadline_ms = None;
     }
 }
 
@@ -455,33 +357,28 @@ impl SafetyPolicy {
 mod tests {
     use super::*;
 
-    const IMPLEMENTED_CAPABILITIES: u16 = CAP_FIVE_VOLT_CONTROL | CAP_ASIC_RESET_CONTROL | CAP_FAN_FORCE_FULL | CAP_TRIP_INPUT_SAMPLED | CAP_FAN_CONTROLLED_SPEED;
+    fn policy() -> SafetyPolicy {
+        SafetyPolicy::new(SafetyConfig::firmware())
+    }
 
-    fn config(stage: SafetyStage) -> SafetyConfig {
-        SafetyConfig {
-            stage,
-            lease_timeout_ms: 1_000,
-            capabilities: IMPLEMENTED_CAPABILITIES,
-        }
+    fn running_policy() -> SafetyPolicy {
+        let mut policy = policy();
+        policy.request_five_volt_enabled(true).unwrap();
+        policy.request_asic_reset_asserted(false).unwrap();
+        policy.request_fan_percent(40).unwrap();
+        policy
     }
 
     #[test]
-    fn every_stage_starts_with_semantic_safe_outputs() {
-        for stage in [SafetyStage::BootSafe, SafetyStage::Lease, SafetyStage::TripLatch] {
-            let policy = SafetyPolicy::new(config(stage));
-            let status = policy.status(0);
+    fn boot_requests_safe_1002_gpio_levels_and_full_fan() {
+        let policy = policy();
+        let status = policy.status();
+        assert_eq!(status.state, SafetyState::SafeOff);
+        assert_eq!(status.outputs, SafetyOutputs::SAFE);
+        assert_eq!(status.runtime_verdict, RuntimeVerdict::GoodSafeOff);
+        assert_ne!(status.evidence & EVIDENCE_OUTPUTS_SAFE, 0);
 
-            assert_eq!(status.state, SafetyState::SafeOff);
-            assert_eq!(status.outputs, SafetyOutputs::SAFE);
-            assert_eq!(status.runtime_verdict, RuntimeVerdict::GoodSafeOff);
-            assert_ne!(status.evidence & EVIDENCE_OUTPUTS_SAFE, 0);
-        }
-    }
-
-    #[test]
-    fn safe_semantics_map_to_low_enable_low_reset_n_and_full_fan() {
-        let intent = SafetyOutputs::SAFE.board_control_intent();
-
+        let intent = status.outputs.board_control_intent();
         assert!(!intent.five_volt_enable_high);
         assert!(!intent.asic_reset_n_high);
         assert_eq!(intent.fan_percent, 100);
@@ -491,197 +388,166 @@ mod tests {
     }
 
     #[test]
-    fn firmware_configuration_is_fixed_and_does_not_claim_hardware_gates() {
-        let config = SafetyConfig::firmware();
-
-        assert_eq!(config.stage, SafetyStage::TripLatch);
-        assert_eq!(config.lease_timeout_ms, PRODUCTION_LEASE_TIMEOUT_MS);
-        assert_eq!(config.capabilities, IMPLEMENTED_CAPABILITIES);
-        assert_eq!(config.capabilities & REQUIRED_PRODUCTION_CAPABILITIES, IMPLEMENTED_CAPABILITIES);
-    }
-
-    #[test]
-    fn boot_safe_stage_retains_legacy_control_after_safe_boot() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::BootSafe));
-
-        policy.request_asic_reset_asserted(false, 0).unwrap();
-        policy.request_fan_percent(50, 0).unwrap();
-        policy.request_five_volt_enabled(true, 0).unwrap();
+    fn direct_gpio_commands_start_and_run_without_arm_or_heartbeat() {
+        let mut policy = running_policy();
+        let expected = policy.status();
+        assert_eq!(expected.state, SafetyState::Controlled);
+        assert_eq!(expected.runtime_verdict, RuntimeVerdict::GoodControlled);
         assert_eq!(
-            policy.outputs(),
+            expected.outputs,
             SafetyOutputs {
                 five_volt_enabled: true,
                 asic_reset_asserted: false,
-                fan_percent: 50,
+                fan_percent: 40,
             }
         );
 
-        policy.request_five_volt_enabled(false, 1).unwrap();
-        assert_eq!(policy.outputs(), SafetyOutputs::SAFE);
+        // The policy has no clock or deadline. Repeated safety service and
+        // read-only status polls cannot expire or renew the output requests.
+        for _ in 0..100_000 {
+            policy.sample_trip_input(false);
+            assert_eq!(policy.status(), expected);
+        }
     }
 
     #[test]
-    fn lease_stage_rejects_unsafe_changes_until_armed() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
-
-        assert_eq!(policy.request_five_volt_enabled(true, 1), Err(SafetyError::LeaseRequired));
-        policy.arm(10).unwrap();
-        assert_eq!(policy.status(10).lease_remaining_ms, 1_000);
-        policy.request_five_volt_enabled(true, 10).unwrap();
-        policy.request_asic_reset_asserted(false, 10).unwrap();
-        assert_eq!(policy.status(10).runtime_verdict, RuntimeVerdict::GoodControlled);
+    fn status_does_not_start_or_change_outputs() {
+        let mut policy = policy();
+        let initial = policy.status();
+        for _ in 0..10 {
+            policy.sample_trip_input(false);
+            assert_eq!(policy.status(), initial);
+        }
+        policy.request_fan_percent(40).unwrap();
+        assert_eq!(policy.status().state, SafetyState::Controlled);
+        policy.request_fan_percent(100).unwrap();
+        // State reflects outputs rather than an armed host session.
+        assert_eq!(policy.status(), initial);
     }
 
     #[test]
-    fn heartbeat_extends_the_lease_and_expiry_latches_safe_outputs() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
-        policy.arm(100).unwrap();
-        policy.request_five_volt_enabled(true, 100).unwrap();
-        policy.request_asic_reset_asserted(false, 100).unwrap();
-        policy.request_fan_percent(40, 100).unwrap();
-        assert_eq!(policy.outputs().fan_percent, 40);
-
-        policy.heartbeat(900).unwrap();
-        policy.tick(1_899, false);
-        assert_eq!(policy.status(1_899).state, SafetyState::Controlled);
-
-        policy.tick(1_900, false);
-        let status = policy.status(1_900);
-        assert_eq!(status.state, SafetyState::FaultLatched);
-        assert_eq!(status.fault, FaultReason::LeaseExpired);
-        assert_eq!(status.outputs, SafetyOutputs::SAFE);
-        assert_eq!(status.runtime_verdict, RuntimeVerdict::BadFault);
-        assert_eq!(policy.heartbeat(1_901), Err(SafetyError::FaultLatched));
-    }
-
-    #[test]
-    fn disarm_is_a_clean_safe_off_but_does_not_erase_a_fault() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
-        policy.arm(0).unwrap();
-        policy.request_five_volt_enabled(true, 0).unwrap();
-        policy.request_asic_reset_asserted(false, 0).unwrap();
-
-        policy.disarm();
-        let status = policy.status(1);
-        assert_eq!(status.state, SafetyState::SafeOff);
-        assert_eq!(status.fault, FaultReason::None);
-        assert_eq!(status.outputs, SafetyOutputs::SAFE);
-        assert_eq!(policy.heartbeat(1), Err(SafetyError::LeaseRequired));
-
-        policy.arm(2).unwrap();
-        policy.tick(1_002, false);
-        policy.disarm();
-        assert_eq!(policy.status(1_003).state, SafetyState::FaultLatched);
-        assert_eq!(policy.status(1_003).fault, FaultReason::LeaseExpired);
-    }
-
-    #[test]
-    fn trip_is_visible_before_enforcement_and_latched_at_stage_two() {
-        let mut observe_only = SafetyPolicy::new(config(SafetyStage::Lease));
-        observe_only.tick(0, true);
-        assert_eq!(observe_only.status(0).fault, FaultReason::None);
-        assert_eq!(observe_only.status(0).runtime_verdict, RuntimeVerdict::BadTripInput);
-
-        let mut enforced = SafetyPolicy::new(config(SafetyStage::TripLatch));
-        enforced.arm(0).unwrap();
-        enforced.request_five_volt_enabled(true, 0).unwrap();
-        enforced.tick(1, true);
-        let status = enforced.status(1);
-        assert_eq!(status.fault, FaultReason::AsicTrip);
-        assert_eq!(status.outputs, SafetyOutputs::SAFE);
-        assert_eq!(enforced.clear_fault(2), Err(SafetyError::TripActive));
-
-        enforced.tick(3, false);
-        enforced.clear_fault(3).unwrap();
-        assert_eq!(enforced.status(3).state, SafetyState::SafeOff);
-        assert_eq!(enforced.status(3).outputs, SafetyOutputs::SAFE);
-    }
-
-    #[test]
-    fn safe_requests_remain_available_while_fault_latched() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
-        policy.arm(0).unwrap();
-        policy.request_five_volt_enabled(true, 0).unwrap();
-        policy.tick(1_000, false);
-
-        policy.request_asic_reset_asserted(true, 1_001).unwrap();
-        policy.request_five_volt_enabled(false, 1_001).unwrap();
-        policy.request_fan_percent(100, 1_001).unwrap();
-        assert_eq!(policy.outputs(), SafetyOutputs::SAFE);
-    }
-
-    #[test]
-    fn full_fan_is_required_before_power_but_control_is_allowed_while_running() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
-
-        policy.arm(0).unwrap();
-        policy.request_fan_percent(50, 0).unwrap();
-        assert_eq!(policy.request_five_volt_enabled(true, 0), Err(SafetyError::FanNotSafe));
-        policy.request_fan_percent(100, 0).unwrap();
-        policy.request_five_volt_enabled(true, 0).unwrap();
-        policy.request_asic_reset_asserted(false, 0).unwrap();
-        policy.request_fan_percent(50, 0).unwrap();
+    fn power_and_reset_ordering_still_apply_without_a_lease() {
+        let mut policy = policy();
+        let initial = policy.status();
+        assert_eq!(policy.request_asic_reset_asserted(false), Err(SafetyError::InvalidSequence));
+        assert_eq!(policy.status(), initial);
+        policy.request_fan_percent(50).unwrap();
+        let before = policy.status();
+        assert_eq!(policy.request_five_volt_enabled(true), Err(SafetyError::FanNotSafe));
+        assert_eq!(policy.status(), before);
+        policy.request_fan_percent(100).unwrap();
+        policy.request_five_volt_enabled(true).unwrap();
+        policy.request_asic_reset_asserted(false).unwrap();
+        let before = policy.status();
+        assert_eq!(policy.request_five_volt_enabled(true), Err(SafetyError::InvalidSequence));
+        assert_eq!(policy.status(), before);
+        policy.request_fan_percent(50).unwrap();
         assert_eq!(policy.outputs().fan_percent, 50);
+    }
 
-        policy.disarm();
+    #[test]
+    fn trip_latches_at_boot_and_while_running_until_explicitly_cleared() {
+        for mut policy in [policy(), running_policy()] {
+            policy.sample_trip_input(true);
+            let status = policy.status();
+            assert_eq!(status.state, SafetyState::FaultLatched);
+            assert_eq!(status.fault, FaultReason::AsicTrip);
+            assert_eq!(status.outputs, SafetyOutputs::SAFE);
+            assert_eq!(status.runtime_verdict, RuntimeVerdict::BadFault);
+            assert_eq!(policy.clear_fault(), Err(SafetyError::TripActive));
+            policy.sample_trip_input(false);
+            assert_eq!(policy.status().fault, FaultReason::AsicTrip);
+            assert_eq!(policy.request_five_volt_enabled(true), Err(SafetyError::FaultLatched));
+            assert_eq!(policy.request_asic_reset_asserted(false), Err(SafetyError::FaultLatched));
+            assert_eq!(policy.request_fan_percent(40), Err(SafetyError::FaultLatched));
+            policy.clear_fault().unwrap();
+            assert_eq!(policy.status().state, SafetyState::SafeOff);
+            assert_eq!(policy.status().fault, FaultReason::None);
+            assert_eq!(policy.outputs(), SafetyOutputs::SAFE);
+            // Recovery needs ordered GPIO commands, with no re-arm step.
+            policy.request_five_volt_enabled(true).unwrap();
+            policy.request_asic_reset_asserted(false).unwrap();
+        }
+    }
+
+    #[test]
+    fn safe_requests_remain_available_and_do_not_erase_a_latched_trip() {
+        let mut policy = running_policy();
+        policy.sample_trip_input(true);
+        policy.request_asic_reset_asserted(true).unwrap();
+        policy.request_five_volt_enabled(false).unwrap();
+        policy.request_fan_percent(100).unwrap();
+        policy.safe_off();
         assert_eq!(policy.outputs(), SafetyOutputs::SAFE);
+        assert_eq!(policy.status().state, SafetyState::FaultLatched);
+        assert_eq!(policy.status().fault, FaultReason::AsicTrip);
     }
 
     #[test]
-    fn current_firmware_capabilities_are_explicitly_not_production_ready() {
-        let policy = SafetyPolicy::new(config(SafetyStage::TripLatch));
-        let status = policy.status(0);
-
-        assert_eq!(status.production_verdict, ProductionVerdict::BadCapabilityGap);
-        assert_eq!(status.capabilities & CAP_CORE_POWER_CUTOFF, 0);
-        assert_eq!(status.capabilities & CAP_FAN_TACH_INTERLOCK, 0);
-        assert_eq!(status.capabilities & CAP_INDEPENDENT_TRIP_MONITOR, 0);
+    fn power_off_and_safe_off_restore_all_outputs_and_allow_direct_restart() {
+        for use_safe_off in [false, true] {
+            let mut policy = running_policy();
+            if use_safe_off {
+                policy.safe_off();
+            } else {
+                policy.request_five_volt_enabled(false).unwrap();
+            }
+            assert_eq!(policy.outputs(), SafetyOutputs::SAFE);
+            assert_eq!(policy.status().state, SafetyState::SafeOff);
+            policy.request_five_volt_enabled(true).unwrap();
+            policy.request_asic_reset_asserted(false).unwrap();
+            assert_eq!(policy.status().state, SafetyState::Controlled);
+        }
     }
 
     #[test]
-    fn production_verdict_requires_stage_capabilities_and_good_runtime() {
-        let ready_config = SafetyConfig {
-            stage: SafetyStage::TripLatch,
-            lease_timeout_ms: 1_000,
-            capabilities: REQUIRED_PRODUCTION_CAPABILITIES,
-        };
-        let mut policy = SafetyPolicy::new(ready_config);
-        assert_eq!(policy.status(0).production_verdict, ProductionVerdict::Good);
-
-        policy.tick(1, true);
-        assert_eq!(policy.status(1).production_verdict, ProductionVerdict::BadRuntime);
+    fn invalid_fan_requests_do_not_change_the_outputs() {
+        let mut policy = running_policy();
+        let before = policy.status();
+        for percent in [101, 255] {
+            assert_eq!(policy.request_fan_percent(percent), Err(SafetyError::InvalidFanPercent));
+            assert_eq!(policy.status(), before);
+        }
     }
 
     #[test]
-    fn safety_status_encoding_is_fixed_and_self_describing() {
-        let mut policy = SafetyPolicy::new(config(SafetyStage::Lease));
-        policy.arm(100).unwrap();
-        let status = policy.status(125);
-        let encoded = status.encode();
-
-        assert_eq!(encoded.len(), SAFETY_STATUS_ENCODED_LEN);
-        assert_eq!(encoded[0], SAFETY_STATUS_SCHEMA_VERSION);
-        assert_eq!(encoded[1], SafetyStage::Lease as u8);
-        assert_eq!(encoded[2], SafetyState::Controlled as u8);
-        assert_eq!(encoded[3], FaultReason::None as u8);
-        assert_eq!(encoded[4], RuntimeVerdict::GoodControlled as u8);
-        assert_eq!(encoded[5], ProductionVerdict::BadStageDisabled as u8);
-        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), IMPLEMENTED_CAPABILITIES);
-        assert_eq!(u32::from_le_bytes(encoded[10..14].try_into().unwrap()), 975);
-        assert_eq!(encoded[14], 0b0000_0110);
-        assert_eq!(encoded[15], 100);
-        assert_eq!(encoded[16], 0);
+    fn current_capabilities_retain_1002_controls_without_claiming_hardware_gates() {
+        let policy = policy();
+        assert_eq!(policy.config().capabilities, 0x008f);
+        assert_eq!(policy.status().production_verdict, ProductionVerdict::BadCapabilityGap);
+        assert_eq!(policy.config().capabilities & CAP_CORE_POWER_CUTOFF, 0);
+        assert_eq!(policy.config().capabilities & CAP_FAN_TACH_INTERLOCK, 0);
+        assert_eq!(policy.config().capabilities & CAP_INDEPENDENT_TRIP_MONITOR, 0);
     }
 
     #[test]
-    fn safety_wire_commands_are_exact_and_reject_trailing_data() {
-        assert_eq!(decode_wire_command(&[0x10]), Some(SafetyWireCommand::GetStatus));
-        assert_eq!(decode_wire_command(&[0x11]), Some(SafetyWireCommand::ArmLease));
-        assert_eq!(decode_wire_command(&[0x12]), Some(SafetyWireCommand::Heartbeat));
-        assert_eq!(decode_wire_command(&[0x13]), Some(SafetyWireCommand::ClearFault));
-        assert_eq!(decode_wire_command(&[0x14]), Some(SafetyWireCommand::Disarm));
-        assert_eq!(decode_wire_command(&[]), None);
-        assert_eq!(decode_wire_command(&[0x10, 0x00]), None);
-        assert_eq!(decode_wire_command(&[0xff]), None);
+    fn production_verdict_still_requires_capabilities_and_good_runtime() {
+        let mut policy = SafetyPolicy::new(SafetyConfig { capabilities: REQUIRED_PRODUCTION_CAPABILITIES });
+        assert_eq!(policy.status().production_verdict, ProductionVerdict::Good);
+        policy.sample_trip_input(true);
+        assert_eq!(policy.status().production_verdict, ProductionVerdict::BadRuntime);
+    }
+
+    #[test]
+    fn schema_two_encodes_outputs_and_faults_without_lease_fields_or_evidence() {
+        // Literal wire vectors catch accidental offset changes in ESP's new decoder.
+        let mut policy = policy();
+        assert_eq!(policy.status().encode().as_slice(), &[2, 3, 0, 0, 0, 0x81, 0x8f, 0, 0x0d, 0, 6, 100, 0]);
+        policy = running_policy();
+        assert_eq!(policy.status().encode().as_slice(), &[2, 3, 1, 0, 1, 0x81, 0x8f, 0, 0x0c, 0, 1, 40, 0]);
+        policy.sample_trip_input(true);
+        assert_eq!(policy.status().encode().as_slice(), &[2, 3, 2, 2, 0x80, 0x82, 0x8f, 0, 1, 0, 6, 100, 1]);
+        assert_eq!(policy.status().encode().len(), SAFETY_STATUS_ENCODED_LEN);
+    }
+
+    #[test]
+    fn supported_wire_commands_are_exact_and_legacy_lease_commands_are_rejected() {
+        for (opcode, command) in [(0x10, SafetyWireCommand::GetStatus), (0x13, SafetyWireCommand::ClearFault), (0x14, SafetyWireCommand::SafeOff)] {
+            assert_eq!(decode_wire_command(&[opcode]), Some(command));
+            assert_eq!(decode_wire_command(&[opcode, 0]), None);
+        }
+        for bytes in [&[][..], &[0x11], &[0x12], &[0x11, 0], &[0x12, 0], &[0xff]] {
+            assert_eq!(decode_wire_command(bytes), None);
+        }
     }
 }

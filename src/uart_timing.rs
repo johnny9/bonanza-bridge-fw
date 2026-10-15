@@ -12,11 +12,19 @@ pub const ASIC_RX_DESIGN_WORDS_PER_SECOND: u32 = 16_000;
 pub const ESP_DATA_BAUD_RATE: u32 = 2_000_000;
 pub const QUALIFICATION_SOAK_SECONDS: u32 = 24 * 60 * 60;
 
-/// ASIC output is meaningful only while its I/O rail is enabled and reset is
-/// released. Keeping the PIO state machine active in any other state can turn
-/// an unpowered low RX line into an endless stream of synthetic zero bytes.
+/// Retain the 1002 receive gate while the bridge owns I/O power and reset.
+/// An unpowered or reset ASIC's RX data must not reach the ESP parser.
 pub const fn asic_rx_forwarding_allowed(five_volt_enabled: bool, asic_reset_asserted: bool) -> bool {
     five_volt_enabled && !asic_reset_asserted
+}
+
+/// Return a hardware gate operation only when its state actually changes.
+/// Reapplying the gate aborts DMA and clears receive counters, so a fan-only
+/// adjustment must not cause it. None as the previous output forces boot setup.
+pub fn asic_rx_forwarding_change(previous: Option<crate::safety::SafetyOutputs>, outputs: crate::safety::SafetyOutputs) -> Option<bool> {
+    let enabled = asic_rx_forwarding_allowed(outputs.five_volt_enabled, outputs.asic_reset_asserted);
+    let was_enabled = previous.map(|outputs| asic_rx_forwarding_allowed(outputs.five_volt_enabled, outputs.asic_reset_asserted));
+    (was_enabled != Some(enabled)).then_some(enabled)
 }
 
 /// Whether a complete ASIC response can be buffered without software draining
@@ -130,5 +138,24 @@ mod tests {
         assert!(!asic_rx_forwarding_allowed(false, false));
         assert!(!asic_rx_forwarding_allowed(true, true));
         assert!(asic_rx_forwarding_allowed(true, false));
+    }
+
+    #[test]
+    fn fan_adjustments_preserve_rx_while_power_and_reset_transitions_gate_it() {
+        use crate::safety::SafetyOutputs;
+
+        let safe = SafetyOutputs::SAFE;
+        let powered = SafetyOutputs { five_volt_enabled: true, ..safe };
+        let running = SafetyOutputs { asic_reset_asserted: false, ..powered };
+        let fan_adjusted = SafetyOutputs { fan_percent: 40, ..running };
+
+        assert_eq!(asic_rx_forwarding_change(None, safe), Some(false));
+        assert_eq!(asic_rx_forwarding_change(Some(safe), powered), None);
+        assert_eq!(asic_rx_forwarding_change(Some(powered), running), Some(true));
+        assert_eq!(asic_rx_forwarding_change(Some(running), fan_adjusted), None);
+        assert_eq!(asic_rx_forwarding_change(Some(fan_adjusted), running), None);
+        assert_eq!(asic_rx_forwarding_change(Some(running), running), None);
+        assert_eq!(asic_rx_forwarding_change(Some(running), powered), Some(false));
+        assert_eq!(asic_rx_forwarding_change(Some(running), safe), Some(false));
     }
 }

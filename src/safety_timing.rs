@@ -5,7 +5,6 @@
 //! machine lives in `safety`, while the UART control task samples inputs,
 //! applies outputs, and feeds the hardware watchdog.
 
-pub const MIN_LEASE_TIMEOUT_MS: u64 = 250;
 pub const WATCHDOG_TIMEOUT_MS: u64 = 3_000;
 pub const CONTROL_WRITE_TIMEOUT_MS: u64 = 100;
 pub const MAX_SAFETY_SERVICE_INTERVAL_MS: u64 = 10;
@@ -32,10 +31,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safety_service_interval_is_well_inside_the_minimum_lease() {
-        assert!(MAX_SAFETY_SERVICE_INTERVAL_MS < MIN_LEASE_TIMEOUT_MS);
-        assert!(CONTROL_WRITE_TIMEOUT_MS < MIN_LEASE_TIMEOUT_MS);
-        assert!(TACH_MEASUREMENT_MS > MIN_LEASE_TIMEOUT_MS);
+    fn bounded_control_operations_leave_time_to_service_the_watchdog() {
+        assert!(MAX_SAFETY_SERVICE_INTERVAL_MS < WATCHDOG_TIMEOUT_MS);
+        assert!(CONTROL_WRITE_TIMEOUT_MS < WATCHDOG_TIMEOUT_MS);
+        assert!(TACH_MEASUREMENT_MS < WATCHDOG_TIMEOUT_MS);
         assert!(TACH_MEASUREMENT_MS / MAX_SAFETY_SERVICE_INTERVAL_MS >= 50);
     }
 
