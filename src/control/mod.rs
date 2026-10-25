@@ -45,6 +45,7 @@ pub async fn uart_task(mut uart: BufferedUart<'static, UART0>) {
                     let status = runtime::snapshot();
                     protocol::response(packet.id, &rx_stats::encode(status.counters.pio_stall_events, status.counters.ring_dropped_words))
                 }
+                Ok(Command::GetQueues) => protocol::response(packet.id, &runtime::queue_snapshot().encode()),
                 Ok(Command::GetStatus) => protocol::response(packet.id, &runtime::snapshot().encode(runtime::now_ms())),
                 Ok(Command::ResetStream) => {
                     reset_token = reset_token.wrapping_add(1);

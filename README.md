@@ -20,7 +20,7 @@ unconnected on the reviewed 1004 design and are not configured by this firmware.
 | Interface | RP2040 TX / RX | ESP TX / RX | Format / rate |
 |---|---|---|---|
 | Control UART0 | GPIO0 / GPIO1 | GPIO43 / GPIO44 | 115200, 8N1 |
-| Data UART1 | GPIO4 / GPIO5 | GPIO17 / GPIO18 | 2 Mbaud, 8N1 |
+| Data UART1 | GPIO4 / GPIO5 | GPIO17 / GPIO18 | 5 Mbaud, 8N1 |
 | ASIC PIO1 | GPIO8 / GPIO9 | — | 5 Mbaud, 9N1 |
 
 ESP-to-ASIC data uses pairs `[low eight bits, bit 8]`; the second byte must be
@@ -31,12 +31,21 @@ survives idle periods and is cleared by `RESET_STREAM`.
 ASIC RX starts without a power/reset gate. Its PIO program requires idle after
 boot/reset and validates the stop bit before pushing a word. Low/unpowered
 input does not produce synthetic zero bytes. Paced DMA drains RX into a
-1024-word ring; the CPU validates each copied window against concurrent DMA
-overwrite. The finite DMA count is rearmed only after its final data is drained.
+4096-word ring; the CPU validates each copied window against concurrent DMA
+overwrite. UART RX also uses a 4096-word DMA ring, retaining each byte's UART
+error bits. Each ring has a separate DMA reload channel so capture continues
+across counter rollover without waiting for the executor. Both output paths
+send blocks with DMA instead of awaiting and accounting for individual words.
+
+At 5 Mbaud, the host ring holds 8.192 ms of full-rate input; the ASIC ring holds
+9.011 ms at its 9N1 wire limit. These are bounded queues: overflow faults the
+stream rather than continuing with a discontinuous byte sequence. UART flags
+are checked before pair decoding. `GET_QUEUES` exposes queue high-water marks,
+overflows, reloads, maximum polling gaps and block-transmit durations.
 
 Both directions share one transport owner. A reset cancels both forwarding
 futures, discards their local chunks and the partial pair, clears PIO/DMA state,
-drains already-queued ESP-bound output through the UART shift register, drains
+aborts pending DMA transfers, drains the ESP UART FIFO/shift register, drains
 ESP input to a quiet boundary, then resumes forwarding before acknowledging.
 The separate control UART remains available for identity, diagnostics, and
 recovery. See the [protocol and recovery contract](docs/1004-protocol.md).
@@ -44,7 +53,7 @@ recovery. See the [protocol and recovery contract](docs/1004-protocol.md).
 ## Identity and compatibility
 
 - Target board: **1004**.
-- Protocol: **3.0**, info schema 1, transport-status schema 1.
+- Protocol: **3.0**, info schema 1, transport-status schema 1, queue-status schema 1.
 - Image manifest: existing 96-byte schema 1, board 1004, bridge kind 1,
   protocol 3.0, build-derived version, and manifest CRC-32.
 - Firmware package: `0.1.0-1004.1`; builds append the Git revision and `.dirty`
@@ -90,6 +99,8 @@ partial-pair recovery, DMA copy overruns, transport status, and watchdog health
 without host traffic. The firmware also builds for `thumbv6m-none-eabi`.
 
 These checks do not establish electrical operation on an assembled 1004 board.
-Hardware qualification still needs the paired ESP implementation, real UART
+Hardware qualification requires the paired 5 Mbaud ESP implementation, real UART
 traffic and fresh ASIC responses, resets during traffic, and watchdog recovery.
 The RP2040 watchdog cannot reset or power down the ASICs on this board.
+
+Hardware queue regression instructions: [queue-testing.md](docs/queue-testing.md).

@@ -47,3 +47,11 @@ pub async fn watchdog_task(mut watchdog: embassy_rp::watchdog::Watchdog) {
         Timer::after_millis(100).await;
     }
 }
+
+static QUEUES: Mutex<CriticalSectionRawMutex, RefCell<bonanza_bridge_fw::queue::QueueStats>> = Mutex::new(RefCell::new(bonanza_bridge_fw::queue::QueueStats::new()));
+pub fn queues(f: impl FnOnce(&mut bonanza_bridge_fw::queue::QueueStats)) {
+    QUEUES.lock(|s| f(&mut s.borrow_mut()));
+}
+pub fn queue_snapshot() -> bonanza_bridge_fw::queue::QueueStats {
+    QUEUES.lock(|s| *s.borrow())
+}

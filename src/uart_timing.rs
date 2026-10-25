@@ -6,35 +6,13 @@ pub const PIO_RX_FIFO_BYTES: usize = 8;
 pub const ASIC_TELEMETRY_FRAME_BYTES: usize = 10;
 pub const ASIC_RX_WIRE_BITS_PER_BYTE: u8 = 11;
 pub const ESP_TX_WIRE_BITS_PER_BYTE: u8 = 10;
-pub const ASIC_RX_DMA_RING_WORDS: usize = 1024;
-pub const ASIC_RX_DMA_TRANSFER_COUNT: u32 = 0x7fff_ffff;
 pub const ASIC_RX_DESIGN_WORDS_PER_SECOND: u32 = 16_000;
-pub const ESP_DATA_BAUD_RATE: u32 = 2_000_000;
-pub const QUALIFICATION_SOAK_SECONDS: u32 = 24 * 60 * 60;
-
-/// A copied DMA window is usable only if the producer has not overwritten its
-/// oldest word while the CPU was copying. Counts are modulo 2^32.
-pub const fn dma_copy_is_valid(produced_after_copy: u32, first_word: u32, capacity: usize) -> bool {
-    produced_after_copy.wrapping_sub(first_word) as usize <= capacity
-}
+pub const ESP_DATA_BAUD_RATE: u32 = 5_000_000;
 
 /// Whether a complete ASIC response can be buffered without software draining
 /// the PIO FIFO while the frame is arriving.
 pub const fn rx_fifo_holds_complete_frame(frame_bytes: usize) -> bool {
     frame_bytes <= PIO_RX_FIFO_BYTES
-}
-
-/// Resolve the readable DMA-ring window from monotonically increasing transfer
-/// counts. If the producer lapped the consumer, retain the newest ring and
-/// report exactly how many older words were overwritten.
-pub const fn dma_ring_window(produced: u32, consumed: u32, capacity: usize) -> (u32, usize, u32) {
-    let available = produced.wrapping_sub(consumed) as usize;
-    if available > capacity {
-        let dropped = available - capacity;
-        (produced.wrapping_sub(capacity as u32), capacity, dropped as u32)
-    } else {
-        (consumed, available, 0)
-    }
 }
 
 /// Return the RP2040 16.8 PIO clock divider bits for a UART baud rate.
@@ -105,29 +83,10 @@ mod tests {
     }
 
     #[test]
-    fn dma_ring_holds_many_complete_tdm_frames() {
-        assert_eq!(ASIC_RX_DMA_RING_WORDS, 1024);
-        assert_eq!(ASIC_RX_DMA_RING_WORDS * size_of::<u32>(), 1 << 12);
-        assert!(ASIC_RX_DMA_RING_WORDS >= 100 * ASIC_TELEMETRY_FRAME_BYTES);
-    }
-
-    #[test]
-    fn dma_ring_window_reports_exact_overwrite_loss() {
-        assert_eq!(dma_ring_window(25, 20, 16), (20, 5, 0));
-        assert_eq!(dma_ring_window(50, 20, 16), (34, 16, 14));
-        assert_eq!(dma_ring_window(3, u32::MAX - 2, 16), (u32::MAX - 2, 6, 0));
-    }
-
-    #[test]
-    fn dma_transfer_counter_covers_the_full_qualification_soak() {
-        assert!((ASIC_RX_DESIGN_WORDS_PER_SECOND as u64) * (QUALIFICATION_SOAK_SECONDS as u64) < ASIC_RX_DMA_TRANSFER_COUNT as u64);
-    }
-
-    #[test]
-    fn dma_copy_rejects_a_concurrent_overwrite_including_counter_wrap() {
-        assert!(dma_copy_is_valid(1024, 0, 1024));
-        assert!(!dma_copy_is_valid(1025, 0, 1024));
-        assert!(dma_copy_is_valid(4, u32::MAX - 3, 8));
-        assert!(!dma_copy_is_valid(5, u32::MAX - 3, 8));
+    fn production_dma_ring_holds_many_complete_tdm_frames() {
+        use crate::queue::{DMA_RELOAD_COUNT, RX_RING_BYTES, RX_RING_WORDS};
+        assert_eq!(RX_RING_BYTES, 1 << 14);
+        assert_eq!(DMA_RELOAD_COUNT as usize % RX_RING_WORDS, 0);
+        assert!(RX_RING_WORDS >= 100 * ASIC_TELEMETRY_FRAME_BYTES);
     }
 }

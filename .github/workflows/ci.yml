@@ -81,6 +81,9 @@ jobs:
       - name: Lint RP2040 hardware code
         run: cargo clippy --bin bonanza-bridge-fw --target thumbv6m-none-eabi --locked -- -D warnings
 
+      - name: Lint hardware qualification fixtures
+        run: cargo clippy --bin bonanza-bridge-fw --target thumbv6m-none-eabi --locked --all-features -- -D warnings
+
       - name: Build release firmware
         run: cargo build --release --locked
 

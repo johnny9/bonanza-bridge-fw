@@ -11,7 +11,7 @@ pub const RX_QUIET_US: u64 = 1_000;
 pub const STATUS_SCHEMA: u8 = 1;
 pub const STATUS_LENGTH: usize = 84;
 // These are protocol-3 transport capabilities, not protocol-1/2 GPIO bits.
-pub const CAPABILITIES: u32 = 0x1f; // pair TX, raw RX, diagnostics, reset, watchdog
+pub const CAPABILITIES: u32 = 0x3f; // pair TX, raw RX, diagnostics, reset, watchdog, queue diagnostics
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,7 +268,7 @@ mod tests {
         status.counters.invalid_pairs = 0x12345678;
         let bytes = status.encode(0x0102030405060708);
         assert_eq!(bytes.len(), 84);
-        assert_eq!(&bytes[..12], &[1, 0, 1, 3, 8, 0, 0xec, 3, 0x1f, 0, 0, 0]);
+        assert_eq!(&bytes[..12], &[1, 0, 1, 3, 8, 0, 0xec, 3, 0x3f, 0, 0, 0]);
         assert_eq!(&bytes[12..20], &[8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(&bytes[28..32], &[8, 0, 0, 0]);
         assert_eq!(&bytes[48..52], &[0x78, 0x56, 0x34, 0x12]);

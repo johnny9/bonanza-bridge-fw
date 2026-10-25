@@ -61,7 +61,13 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     watch_git_state();
 
-    let firmware_version = env::var(VERSION_OVERRIDE).unwrap_or_else(|_| default_firmware_version());
+    let mut firmware_version = env::var(VERSION_OVERRIDE).unwrap_or_else(|_| default_firmware_version());
+    // Bench images must remain visibly distinct even without a version override.
+    if env::var_os("CARGO_FEATURE_BENCH_SOURCE").is_some() {
+        firmware_version.push_str(".bench-source");
+    } else if env::var_os("CARGO_FEATURE_BENCH_LOOPBACK").is_some() {
+        firmware_version.push_str(".bench-loopback");
+    }
     validate_firmware_version(&firmware_version);
     println!("cargo:rustc-env=BRIDGE_FIRMWARE_VERSION={firmware_version}");
 }

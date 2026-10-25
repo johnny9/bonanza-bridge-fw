@@ -1,47 +1,43 @@
-use crate::runtime;
+use crate::{
+    dma_ring::{DmaRing, Ring},
+    runtime,
+};
 use bonanza_bridge_fw::{
     pio_programs,
+    queue::{RX_POLL_US, TRANSFER_BYTES},
     transport::{Activity, Code, Fault, Source},
     uart_codec::asic_rx_word_to_u8,
-    uart_timing::{clock_divider_bits, dma_copy_is_valid, dma_ring_window, ASIC_RX_DMA_RING_WORDS, ASIC_RX_DMA_TRANSFER_COUNT},
-};
-use core::{
-    cell::UnsafeCell,
-    sync::atomic::{compiler_fence, Ordering},
+    uart_timing::clock_divider_bits,
 };
 use embassy_rp::{
     clocks::clk_sys_freq,
     gpio::{Level, Pull},
     pac,
-    peripherals::{DMA_CH0, PIO1},
+    peripherals::{DMA_CH0, DMA_CH1, DMA_CH4, PIO1},
     pio::{Common, Config, Direction, FifoJoin, PioPin, ShiftDirection, StateMachine},
+    Peripheral, PeripheralRef,
 };
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 
 const RX_SM: usize = 1;
-const DMA_CHANNEL: usize = 0;
 const FRAMING_IRQ: u8 = 1 << 4;
 
-#[repr(C, align(4096))]
-struct DmaRing(UnsafeCell<[u32; ASIC_RX_DMA_RING_WORDS]>);
-// Only AsicRx (which owns DMA_CH0) accesses this ring. DMA writes concurrently;
-// the sole CPU reader uses volatile reads and validates the copied window.
-unsafe impl Sync for DmaRing {}
-static RING: DmaRing = DmaRing(UnsafeCell::new([0; ASIC_RX_DMA_RING_WORDS]));
+static ASIC_RING: Ring = Ring::new();
 
 pub struct AsicTx {
     sm: StateMachine<'static, PIO1, 0>,
+    dma: PeripheralRef<'static, DMA_CH1>,
     origin: u8,
 }
 
 pub struct AsicRx {
     sm: StateMachine<'static, PIO1, 1>,
-    _dma: DMA_CH0,
+    ring: DmaRing,
     origin: u8,
-    consumed: u32,
 }
 
-pub fn new(common: &mut Common<'static, PIO1>, mut tx: StateMachine<'static, PIO1, 0>, mut rx: StateMachine<'static, PIO1, 1>, tx_pin: impl PioPin, rx_pin: impl PioPin, dma: DMA_CH0, baud: u32) -> (AsicTx, AsicRx) {
+pub fn new(common: &mut Common<'static, PIO1>, mut tx: StateMachine<'static, PIO1, 0>, mut rx: StateMachine<'static, PIO1, 1>, tx_pin: impl PioPin, rx_pin: impl PioPin, channels: (DMA_CH0, DMA_CH1, DMA_CH4), baud: u32) -> (AsicTx, AsicRx) {
+    let (dma, tx_dma, reload) = channels;
     let tx_pin = common.make_pio_pin(tx_pin);
     tx.set_pins(Level::High, &[&tx_pin]);
     tx.set_pin_dirs(Direction::Out, &[&tx_pin]);
@@ -66,6 +62,11 @@ pub fn new(common: &mut Common<'static, PIO1>, mut tx: StateMachine<'static, PIO
     config.use_program(&rx_program, &[]);
     config.set_in_pins(&[&rx_pin]);
     config.set_jmp_pin(&rx_pin);
+    #[cfg(feature = "bench-loopback")]
+    {
+        config.set_in_pins(&[&tx_pin]);
+        config.set_jmp_pin(&tx_pin);
+    }
     config.shift_in.direction = ShiftDirection::Right;
     // PUSH is explicit and only occurs after a valid stop bit.
     config.shift_in.auto_fill = false;
@@ -76,19 +77,32 @@ pub fn new(common: &mut Common<'static, PIO1>, mut tx: StateMachine<'static, PIO
     rx.set_enable(false);
 
     (
-        AsicTx { sm: tx, origin: tx_program.origin },
+        AsicTx {
+            sm: tx,
+            dma: tx_dma.into_ref(),
+            origin: tx_program.origin,
+        },
         AsicRx {
             sm: rx,
-            _dma: dma,
+            ring: DmaRing::new(dma.into(), reload.into(), pac::PIO1.rxf(RX_SM).as_ptr(), pac::dma::vals::TreqSel::PIO1_RX1, &ASIC_RING, 1),
             origin: rx_program.origin,
-            consumed: 0,
         },
     )
 }
 
 impl AsicTx {
-    pub async fn write(&mut self, word: u16) {
-        self.sm.tx().wait_push((word & 0x1ff) as u32).await;
+    pub async fn write(&mut self, words: &[u16]) -> Result<(), Fault> {
+        let started = Instant::now().as_micros();
+        self.sm.tx().dma_push(self.dma.reborrow(), words).await;
+        let elapsed = Instant::now().as_micros() - started;
+        runtime::queues(|s| {
+            s.tx_blocks[0] = s.tx_blocks[0].wrapping_add(1);
+            s.tx_max_us[0] = s.tx_max_us[0].max(elapsed as u32);
+        });
+        if pac::DMA.ch(1).ctrl_trig().read().ahb_error() {
+            return Err(Fault::new(Source::Dma, Code::DmaBus));
+        }
+        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -110,29 +124,6 @@ impl AsicTx {
 }
 
 impl AsicRx {
-    fn start_dma(&mut self) {
-        let channel = pac::DMA.ch(DMA_CHANNEL);
-        channel.read_addr().write_value(pac::PIO1.rxf(RX_SM).as_ptr() as u32);
-        channel.write_addr().write_value(RING.0.get().cast::<u32>() as u32);
-        channel.trans_count().write(|w| *w = ASIC_RX_DMA_TRANSFER_COUNT);
-        self.consumed = 0;
-        compiler_fence(Ordering::SeqCst);
-        channel.ctrl_trig().write(|w| {
-            w.set_read_error(true); // W1C sticky errors from an earlier attempt
-            w.set_write_error(true);
-            w.set_high_priority(true);
-            w.set_data_size(pac::dma::vals::DataSize::SIZE_WORD);
-            w.set_incr_read(false);
-            w.set_incr_write(true);
-            w.set_ring_size(12);
-            w.set_ring_sel(true);
-            w.set_chain_to(DMA_CHANNEL as u8);
-            w.set_treq_sel(pac::dma::vals::TreqSel::PIO1_RX1);
-            w.set_en(true);
-        });
-        compiler_fence(Ordering::SeqCst);
-    }
-
     pub fn start(&mut self) {
         self.sm.clear_fifos();
         self.sm.restart();
@@ -141,26 +132,19 @@ impl AsicRx {
         unsafe {
             self.sm.exec_instr(self.origin as u16);
         }
-        self.start_dma();
+        self.ring.start();
         self.sm.set_enable(true);
     }
 
     pub async fn stop(&mut self) {
         self.sm.set_enable(false);
-        pac::DMA.chan_abort().write(|w| w.set_chan_abort(1 << DMA_CHANNEL));
-        // Wait for the abort handshake as well as BUSY. This loop is always
-        // enclosed by the transport owner's reset timeout; never spin here.
-        while pac::DMA.chan_abort().read().chan_abort() & (1 << DMA_CHANNEL) != 0 || pac::DMA.ch(DMA_CHANNEL).ctrl_trig().read().busy() {
-            Timer::after_micros(10).await;
-        }
-        compiler_fence(Ordering::SeqCst);
-        self.observe_errors();
+        self.ring.stop().await;
+        let _ = self.observe_errors();
         self.sm.clear_fifos();
         self.sm.restart();
-        self.consumed = 0;
     }
 
-    fn observe_errors(&mut self) {
+    fn observe_errors(&mut self) -> Option<Fault> {
         let stalled = pac::PIO1.fdebug().read().rxstall() & (1 << RX_SM) != 0;
         if stalled {
             pac::PIO1.fdebug().write(|w| w.set_rxstall(1 << RX_SM));
@@ -181,59 +165,31 @@ impl AsicRx {
                 }
             });
         }
-    }
-
-    fn record_loss(count: u32) {
-        if count != 0 {
-            runtime::update(|s| {
-                s.counters.ring_dropped_words = s.counters.ring_dropped_words.wrapping_add(count);
-                s.record(Fault::new(Source::Dma, Code::RingOverwrite));
-            });
-        }
+        // A bad stop can occur while ASIC power/reset changes. FIFO exhaustion
+        // means capture lost data and must stop the stream instead of forwarding
+        // an incomplete response as though the receive queue were intact.
+        stalled.then(|| Fault::new(Source::AsicRx, Code::FifoStall))
     }
 
     pub async fn receive(&mut self, output: &mut [u8]) -> Result<usize, Fault> {
-        assert!(!output.is_empty());
+        let mut raw = [0u32; TRANSFER_BYTES];
         loop {
             runtime::service(Activity::Rx);
-            self.observe_errors();
-            let channel = pac::DMA.ch(DMA_CHANNEL);
-            let ctrl = channel.ctrl_trig().read();
-            if ctrl.read_error() || ctrl.write_error() {
-                return Err(Fault::new(Source::Dma, Code::DmaBus));
+            if let Some(fault) = self.observe_errors() {
+                return Err(fault);
             }
-            let remaining = channel.trans_count().read();
-            if remaining > ASIC_RX_DMA_TRANSFER_COUNT || (!ctrl.busy() && remaining != 0) {
-                return Err(Fault::new(Source::Dma, Code::DmaBus));
-            }
-            let produced = ASIC_RX_DMA_TRANSFER_COUNT - remaining;
-            let (first, available, dropped) = dma_ring_window(produced, self.consumed, ASIC_RX_DMA_RING_WORDS);
-            Self::record_loss(dropped);
-            self.consumed = first;
-            if available != 0 {
-                let count = available.min(output.len());
-                compiler_fence(Ordering::Acquire);
-                for (offset, byte) in output[..count].iter_mut().enumerate() {
-                    let index = first.wrapping_add(offset as u32) as usize % ASIC_RX_DMA_RING_WORDS;
-                    let raw = unsafe { core::ptr::read_volatile(RING.0.get().cast::<u32>().add(index)) };
-                    *byte = asic_rx_word_to_u8(raw);
+            let count = match self.ring.read(&mut raw[..output.len().min(TRANSFER_BYTES)]) {
+                Ok(count) => count,
+                Err(fault) => return Err(fault),
+            };
+            if count != 0 {
+                for (byte, word) in output.iter_mut().zip(raw[..count].iter()) {
+                    *byte = asic_rx_word_to_u8(*word);
                 }
-                compiler_fence(Ordering::SeqCst);
-                let after = ASIC_RX_DMA_TRANSFER_COUNT - channel.trans_count().read();
-                if dma_copy_is_valid(after, first, ASIC_RX_DMA_RING_WORDS) {
-                    self.consumed = first.wrapping_add(count as u32);
-                    runtime::update(|s| s.counters.asic_rx_bytes = s.counters.asic_rx_bytes.wrapping_add(count as u32));
-                    return Ok(count);
-                }
-                // DMA lapped the copy. Do not emit a mixture of old/new words.
-                // The next iteration accounts for all lost words exactly once.
-            } else if remaining == 0 && !channel.ctrl_trig().read().busy() {
-                // Preserve and drain the final ring before rearming the finite
-                // counter. The PIO FIFO remains intact during this operation.
-                self.start_dma();
-                runtime::update(|s| s.counters.dma_rearms = s.counters.dma_rearms.wrapping_add(1));
+                runtime::update(|s| s.counters.asic_rx_bytes = s.counters.asic_rx_bytes.wrapping_add(count as u32));
+                return Ok(count);
             }
-            Timer::after_micros(250).await;
+            Timer::after_micros(RX_POLL_US).await;
         }
     }
 }

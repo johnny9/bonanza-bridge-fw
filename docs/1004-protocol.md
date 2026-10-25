@@ -8,7 +8,7 @@ claims a physical board-output change. There is no host lease, heartbeat,
 session identifier, or normal start/stop operation. Both data directions start
 at boot and remain active during idle periods and absent status polls.
 
-The separate control UART uses 115200 baud/8N1. Data UART uses 2 Mbaud/8N1;
+The separate control UART uses 115200 baud/8N1. Data UART uses 5 Mbaud/8N1;
 ASIC serial uses 5 Mbaud/9N1. ESP-to-ASIC encoding is `[low byte, bit 8]`;
 ASIC-to-ESP bytes contain only bits 0..7. The wire formats are unchanged.
 
@@ -33,6 +33,7 @@ schema and exact length; discard failed transactions rather than reuse status.
 | `0x02` | `GET_RX_STATS` | Schema 1 + u32 PIO stall observations + u32 DMA overwritten words |
 | `0x03` | `GET_STATUS` | 84-byte transport status below |
 | `0x04` | `RESET_STREAM` | Transport status after a completed reset |
+| `0x05` | `GET_QUEUES` | 68-byte queue status, schema 1 |
 
 All protocol-1/2 board-control commands are unsupported, including system
 `0x10..0x14`, GPIO page `0x06`, and fan page `0x09`. Their response is error
@@ -67,7 +68,7 @@ software acceptance/queueing, not proof that an ASIC processed a command.
 | 4 | 1 | Last error code |
 | 5 | 1 | Watchdog feed eligibility at this snapshot (0/1) |
 | 6 | 2 | Board version 1004 |
-| 8 | 4 | Transport capabilities `0x1f` |
+| 8 | 4 | Transport capabilities `0x3f` |
 | 12 | 8 | Bridge uptime in milliseconds |
 | 20 | 4 | Stream generation, incremented only after a successful reset |
 | 24 | 4 | Successful stream resets |
@@ -82,12 +83,12 @@ software acceptance/queueing, not proof that an ASIC processed a command.
 | 60 | 4 | PIO invalid-stop/break flag observations |
 | 64 | 4 | PIO RX FIFO stall flag observations |
 | 68 | 4 | DMA ring overwritten words |
-| 72 | 4 | Automatic rearms after the finite DMA count ends |
+| 72 | 4 | Legacy ASIC RX rearm counter; use GET_QUEUES for DMA reloads |
 | 76 | 4 | Failed reset operations |
 | 80 | 4 | ESP input bytes discarded by reset cleanup |
 
 Capability bits: 0 pair-encoded TX, 1 raw RX, 2 transport diagnostics,
-3 coordinated stream reset, 4 local progress watchdog. These bits belong to
+3 coordinated stream reset, 4 local progress watchdog, 5 queue diagnostics. These bits belong to
 protocol 3 and must not be decoded as the old GPIO capability mask.
 
 Error sources: 0 none, 1 control, 2 ESP data UART, 3 pair decoder, 4 ASIC RX,
@@ -100,6 +101,34 @@ Historical errors remain visible after successful recovery. Use phase and
 counter deltas to distinguish current operation from past errors. `RUNNING`
 means the bridge forwarding tasks are active; it does not mean ASICs are
 powered, enumerated, hashing, or safe.
+
+## Queue status
+
+`GET_QUEUES` returns 68 bytes: schema byte 1 followed by three reserved zero
+bytes, then sixteen u32LE fields. Counters survive stream reset and clear on
+bridge reboot. RX entries hold one byte/ASIC word plus its hardware status;
+4096 entries occupy 16 KiB per ring. TX counts describe DMA blocks, not ASIC
+acceptance. Maximum durations include executor scheduling.
+
+| Offset | Field |
+|---:|---|
+| 4 | Configured ESP data baud |
+| 8 | Entries per RX ring |
+| 12, 16 | Host RX / ASIC RX high-water marks in entries |
+| 20, 24 | Host RX / ASIC RX overwrite events |
+| 28, 32 | Host RX / ASIC RX automatic DMA reloads |
+| 36, 40 | Host RX / ASIC RX maximum consumer polling gap, microseconds |
+| 44, 48 | ASIC TX / ESP TX completed DMA blocks |
+| 52, 56 | ASIC TX / ESP TX maximum block completion time, microseconds |
+| 60 | Host UART errored batches |
+| 64 | Observed UART DR error-bit bitmap, bits 8 framing, 9 parity, 10 break, 11 overrun |
+
+Each receive DMA transfer counts 1,048,576 words, then chains to its reload
+channel. Ring addresses keep wrapping across the reload. Consumers observe
+remaining counts frequently and validate copied windows before releasing data.
+A polling gap long enough to hide an entire counter cycle faults the stream.
+No queue can absorb an unbounded consumer stall or provide backpressure over
+the board's data UART without flow-control wires.
 
 ## Stream reset and ESP integration
 
@@ -125,7 +154,7 @@ The bridge implements a reset as one operation owned by the transport task:
 1. Cancel both forwarding futures, dropping local chunks/partial write state.
 2. Clear the pair decoder and ASIC TX FIFO/shift state, holding TX idle high.
 3. Disable ASIC RX, complete the DMA-abort handshake, and clear RX FIFO/state.
-4. Flush the ESP-bound software queue **and wait for UART hardware TX idle**.
+4. Stop host RX DMA, cancel pending ESP TX DMA, and **wait for UART hardware TX idle**.
 5. Drain buffered ESP input and pending UART errors until a 1 ms quiet interval.
 6. Restart clean RX DMA/PIO and TX automatically, increment generation, and
    return status. Read-only commands never request these steps.
@@ -152,10 +181,11 @@ traffic or status-poll minimum exists. Data operations use 50 ms waits so a
 stalled operation cannot indefinitely masquerade as healthy task progress.
 
 Malformed ESP byte pairs, UART errors, blocked data output, and DMA bus/stopped
-channel faults stop forwarding and report phase faulted. PIO invalid stops are
-discarded; FIFO stall and ring overwrite observations remain diagnostic counters
-while forwarding continues. An ASIC response parser must still detect and
-recover from dropped/corrupt responses.
+channel faults, FIFO stalls, and either RX-ring overwrite stop forwarding and report phase
+faulted. UART error bits travel with their bytes and are checked before pair
+decoding. PIO invalid stops are discarded and counted, including breaks during
+ASIC power/reset changes. An ASIC response parser must still detect and recover
+from dropped/corrupt responses.
 
 Watchdog reset affects the RP2040 only. It does not assert ASIC reset, cut power,
 or force fan speed on 1004. The ESP must detect bridge failure/restart and run

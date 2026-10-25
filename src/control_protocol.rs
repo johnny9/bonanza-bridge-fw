@@ -11,6 +11,7 @@ pub enum Command {
     GetRxStats,
     GetStatus,
     ResetStream,
+    GetQueues,
 }
 
 #[repr(u8)]
@@ -36,6 +37,7 @@ pub fn decode(bytes: &[u8]) -> Result<Command, Error> {
         [_, 0, 0, 2] => Ok(Command::GetRxStats),
         [_, 0, 0, 3] => Ok(Command::GetStatus),
         [_, 0, 0, 4] => Ok(Command::ResetStream),
+        [_, 0, 0, 5] => Ok(Command::GetQueues),
         _ => Err(Error::Invalid),
     }
 }
@@ -73,7 +75,7 @@ mod tests {
     use super::*;
     #[test]
     fn only_transport_commands_on_bus_zero_are_accepted() {
-        for (code, command) in [(1, Command::GetInfo), (2, Command::GetRxStats), (3, Command::GetStatus), (4, Command::ResetStream)] {
+        for (code, command) in [(1, Command::GetInfo), (2, Command::GetRxStats), (3, Command::GetStatus), (4, Command::ResetStream), (5, Command::GetQueues)] {
             assert_eq!(decode(&[42, 0, 0, code]), Ok(command));
             assert_eq!(decode(&[42, 1, 0, code]), Err(Error::Invalid));
             assert_eq!(decode(&[42, 0, 0, code, 0]), Err(Error::Invalid));

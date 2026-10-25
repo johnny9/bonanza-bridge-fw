@@ -1,8 +1,13 @@
 [package]
 name = "bonanza-bridge-fw"
-version = "0.1.0-1004.1"
+version = "0.1.0-1004.2"
 edition = "2021"
 license = "MIT"
+
+[features]
+# Bench only: ASIC power must remain OFF. Feed TX GPIO8 back to the RX SM.
+bench-loopback = []
+bench-source = ["bench-loopback"]
 
 [dependencies]
 heapless = { version = "0.8.0", features = ["portable-atomic", "defmt-03"] }
