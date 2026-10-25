@@ -5,7 +5,7 @@ commit `a0c96ae0a20a75879d128308e84aea824c3d7da0` on the public `1104x` branch o
 [bitaxeorg/bitaxeBonanza](https://github.com/bitaxeorg/bitaxeBonanza/tree/1104x).
 The hardware is marked 1004x; the branch spelling is not the firmware board ID.
 
-This branch is `feat/1004-uart`. The 1002 no-lease implementation is preserved
+This branch is `fix/1004-5mbaud-queues`, based on `feat/1004-uart`. The 1002 no-lease implementation is preserved
 on `feat/1002-no-lease` at `6363665`. The earlier working source and original
 binary-source references remain tagged `1002-lease-working-20261006` and
 `1002-binary-source-20261006`.
@@ -56,7 +56,7 @@ recovery. See the [protocol and recovery contract](docs/1004-protocol.md).
 - Protocol: **3.0**, info schema 1, transport-status schema 1, queue-status schema 1.
 - Image manifest: existing 96-byte schema 1, board 1004, bridge kind 1,
   protocol 3.0, build-derived version, and manifest CRC-32.
-- Firmware package: `0.1.0-1004.1`; builds append the Git revision and `.dirty`
+- Firmware package: `0.1.0-1004.2`; builds append the Git revision and `.dirty`
   when applicable. `BONANZA_BRIDGE_FW_VERSION` remains available as an override.
 
 Protocol 1/2 GPIO, fan, safety, arm, heartbeat, clear-fault, and safe-off
